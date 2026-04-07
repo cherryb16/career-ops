@@ -61,7 +61,7 @@
 
   .page {
     width: 100%;
-    max-width: {{PAGE_WIDTH}};
+    max-width: var(--page-width, 800px);
     margin: 0 auto;
     padding: 0;
   }
@@ -330,7 +330,7 @@
 </style>
 </head>
 <body>
-<div class="page">
+<div class="page" style="--page-width: {{PAGE_WIDTH}};">
 
   <!-- HEADER -->
   <div class="header">
