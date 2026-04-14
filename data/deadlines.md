@@ -1,11 +1,11 @@
 # Consulting Recruiting Deadlines
-## Source: ManagementConsulted.com — Updated April 6, 2026
+## Source: ManagementConsulted.com — Updated April 13, 2026
 
 ## MBB — Full-Time ⭐ TOP PRIORITY
 
 | Firm | Role | Deadline | Apply URL | Status |
 |------|------|----------|-----------|--------|
-| BCG | Full Time Associate (UG/MS Class of 2027) | **Jul 7, 2026** | careers.bcg.com | Open soon |
+| BCG | Full Time Associate (UG/MS Class of 2027) | **Jul 7, 2026** | careers.bcg.com | **Open — Applied ✅** |
 | Bain | Associate Consultant (UG/MS Class of 2027) | **Jul 19, 2026** | bain.com/careers | Open soon |
 | McKinsey | Business Analyst (UG/MS Class of 2027) | **Aug 11, 2026** | mckinsey.com/careers | Opens Jul 1 |
 
