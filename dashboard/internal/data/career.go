@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/santifer/career-ops/dashboard/internal/model"
 )
@@ -14,12 +16,12 @@ import (
 var (
 	reReportLink     = regexp.MustCompile(`\[(\d+)\]\(([^)]+)\)`)
 	reScoreValue     = regexp.MustCompile(`(\d+\.?\d*)/5`)
-	reArchetype      = regexp.MustCompile(`(?i)\*\*Archetype(?:\s+detected)?\*\*\s*\|\s*(.+)`)
+	reArchetype      = regexp.MustCompile(`(?i)\*\*Arquetipo(?:\s+detectado)?\*\*\s*\|\s*(.+)`)
 	reTlDr           = regexp.MustCompile(`(?i)\*\*TL;DR\*\*\s*\|\s*(.+)`)
 	reTlDrColon      = regexp.MustCompile(`(?i)\*\*TL;DR:\*\*\s*(.+)`)
 	reRemote         = regexp.MustCompile(`(?i)\*\*Remote\*\*\s*\|\s*(.+)`)
 	reComp           = regexp.MustCompile(`(?i)\*\*Comp\*\*\s*\|\s*(.+)`)
-	reArchetypeColon = regexp.MustCompile(`(?i)\*\*Archetype:\*\*\s*(.+)`)
+	reArchetypeColon = regexp.MustCompile(`(?i)\*\*Arquetipo:\*\*\s*(.+)`)
 	reReportURL      = regexp.MustCompile(`(?m)^\*\*URL:\*\*\s*(https?://\S+)`)
 	reBatchID        = regexp.MustCompile(`(?m)^\*\*Batch ID:\*\*\s*(\d+)`)
 )
@@ -468,28 +470,29 @@ func NormalizeStatus(raw string) string {
 	// Strip markdown bold and trailing dates
 	s := strings.ReplaceAll(raw, "**", "")
 	s = strings.TrimSpace(strings.ToLower(s))
-	// Strip trailing date (for example, "applied 2026-03-12")
+	// Strip trailing date (e.g., "aplicado 2026-03-12")
 	if idx := strings.Index(s, " 202"); idx > 0 {
 		s = strings.TrimSpace(s[:idx])
 	}
 
 	switch {
-	case strings.Contains(s, "no apply") || strings.Contains(s, "no_apply") || s == "skip" || strings.Contains(s, "geo blocker"):
+	// Most restrictive first — accepts both English and Spanish
+	case strings.Contains(s, "no aplicar") || strings.Contains(s, "no_aplicar") || s == "skip" || strings.Contains(s, "geo blocker"):
 		return "skip"
-	case strings.Contains(s, "interview") || strings.Contains(s, "screening") || strings.Contains(s, "phone_screen") || strings.Contains(s, "onsite"):
+	case strings.Contains(s, "interview") || strings.Contains(s, "entrevista"):
 		return "interview"
-	case s == "offer" || strings.Contains(s, "offered"):
+	case s == "offer" || strings.Contains(s, "oferta"):
 		return "offer"
-	case strings.Contains(s, "responded"):
+	case strings.Contains(s, "responded") || strings.Contains(s, "respondido"):
 		return "responded"
-	case strings.Contains(s, "applied") || s == "submitted" || s == "sent":
+	case strings.Contains(s, "applied") || strings.Contains(s, "aplicado") || s == "enviada" || s == "aplicada" || s == "sent":
 		return "applied"
-	case strings.Contains(s, "rejected"):
+	case strings.Contains(s, "rejected") || strings.Contains(s, "rechazado") || s == "rechazada":
 		return "rejected"
-	case strings.Contains(s, "discarded") || s == "closed" || s == "cancelled" || s == "canceled" ||
-		strings.HasPrefix(s, "duplicate") || strings.HasPrefix(s, "dup") || strings.HasPrefix(s, "repost"):
+	case strings.Contains(s, "discarded") || strings.Contains(s, "descartado") || s == "descartada" || s == "cerrada" || s == "cancelada" ||
+		strings.HasPrefix(s, "duplicado") || strings.HasPrefix(s, "dup"):
 		return "discarded"
-	case strings.Contains(s, "evaluated") || s == "to apply" || s == "to_apply" || s == "watch" || s == "watching" || s == "under_review":
+	case strings.Contains(s, "evaluated") || strings.Contains(s, "evaluada") || s == "condicional" || s == "hold" || s == "monitor" || s == "evaluar" || s == "verificar":
 		return "evaluated"
 	default:
 		return s
@@ -539,7 +542,11 @@ func UpdateApplicationStatus(careerOpsPath string, app model.CareerApplication, 
 	filePath := filepath.Join(careerOpsPath, "applications.md")
 	content, err := os.ReadFile(filePath)
 	if err != nil {
-		return err
+		filePath = filepath.Join(careerOpsPath, "data", "applications.md")
+		content, err = os.ReadFile(filePath)
+		if err != nil {
+			return err
+		}
 	}
 
 	lines := strings.Split(string(content), "\n")
@@ -600,4 +607,130 @@ func StatusPriority(status string) int {
 	default:
 		return 8
 	}
+}
+
+// ComputeProgressMetrics computes progress-oriented analytics from applications.
+func ComputeProgressMetrics(apps []model.CareerApplication) model.ProgressMetrics {
+	pm := model.ProgressMetrics{}
+
+	// Count by normalized status
+	statusCounts := make(map[string]int)
+	var totalScore float64
+	var scored int
+
+	for _, app := range apps {
+		norm := NormalizeStatus(app.Status)
+		statusCounts[norm]++
+
+		if app.Score > 0 {
+			totalScore += app.Score
+			scored++
+			if app.Score > pm.TopScore {
+				pm.TopScore = app.Score
+			}
+		}
+
+		if norm == "offer" {
+			pm.TotalOffers++
+		}
+		if norm != "skip" && norm != "rejected" && norm != "discarded" {
+			pm.ActiveApps++
+		}
+	}
+
+	if scored > 0 {
+		pm.AvgScore = totalScore / float64(scored)
+	}
+
+	// Funnel: each stage counts all apps that reached at least that stage.
+	// An app in "interview" has passed through evaluated -> applied -> responded -> interview.
+	total := len(apps)
+	applied := statusCounts["applied"] + statusCounts["responded"] + statusCounts["interview"] + statusCounts["offer"] + statusCounts["rejected"]
+	responded := statusCounts["responded"] + statusCounts["interview"] + statusCounts["offer"]
+	interview := statusCounts["interview"] + statusCounts["offer"]
+	offer := statusCounts["offer"]
+
+	pm.FunnelStages = []model.FunnelStage{
+		{Label: "Evaluated", Count: total, Pct: 100.0},
+		{Label: "Applied", Count: applied, Pct: safePct(applied, total)},
+		{Label: "Responded", Count: responded, Pct: safePct(responded, applied)},
+		{Label: "Interview", Count: interview, Pct: safePct(interview, applied)},
+		{Label: "Offer", Count: offer, Pct: safePct(offer, applied)},
+	}
+
+	// Rates (relative to applied)
+	if applied > 0 {
+		pm.ResponseRate = float64(responded) / float64(applied) * 100
+		pm.InterviewRate = float64(interview) / float64(applied) * 100
+		pm.OfferRate = float64(offer) / float64(applied) * 100
+	}
+
+	// Score distribution
+	buckets := [5]int{} // 0: 4.5-5.0, 1: 4.0-4.4, 2: 3.5-3.9, 3: 3.0-3.4, 4: <3.0
+	for _, app := range apps {
+		if app.Score <= 0 {
+			continue
+		}
+		switch {
+		case app.Score >= 4.5:
+			buckets[0]++
+		case app.Score >= 4.0:
+			buckets[1]++
+		case app.Score >= 3.5:
+			buckets[2]++
+		case app.Score >= 3.0:
+			buckets[3]++
+		default:
+			buckets[4]++
+		}
+	}
+	pm.ScoreBuckets = []model.ScoreBucket{
+		{Label: "4.5-5.0", Count: buckets[0]},
+		{Label: "4.0-4.4", Count: buckets[1]},
+		{Label: "3.5-3.9", Count: buckets[2]},
+		{Label: "3.0-3.4", Count: buckets[3]},
+		{Label: "  <3.0", Count: buckets[4]},
+	}
+
+	// Weekly activity: group by ISO week from Date field, show last 8 weeks.
+	weekCounts := make(map[string]int)
+	for _, app := range apps {
+		if app.Date == "" {
+			continue
+		}
+		t, err := time.Parse("2006-01-02", app.Date)
+		if err != nil {
+			continue
+		}
+		year, week := t.ISOWeek()
+		key := fmt.Sprintf("%d-W%02d", year, week)
+		weekCounts[key]++
+	}
+
+	// Sort weeks and take last 8
+	var weeks []string
+	for w := range weekCounts {
+		weeks = append(weeks, w)
+	}
+	sort.Strings(weeks)
+	if len(weeks) > 8 {
+		weeks = weeks[len(weeks)-8:]
+	}
+
+	for _, w := range weeks {
+		pm.WeeklyActivity = append(pm.WeeklyActivity, model.WeekActivity{
+			Week:  w,
+			Count: weekCounts[w],
+		})
+	}
+
+	return pm
+}
+
+// safePct returns the percentage of part/whole, or 0 if whole is 0.
+func safePct(part, whole int) float64 {
+	if whole == 0 {
+		return 0
+	}
+	return float64(part) / float64(whole) * 100
 }
