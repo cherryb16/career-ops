@@ -173,6 +173,9 @@ Default modes are in `modes/` (English). Additional language-specific modes are 
 - **French (Francophone market):** `modes/fr/` — native French translations with France/Belgium/Switzerland/Luxembourg-specific vocabulary (CDI/CDD, convention collective SYNTEC, RTT, mutuelle, prévoyance, 13e mois, intéressement/participation, titres-restaurant, CSE, portage salarial, etc.). Includes `_shared.md`, `offre.md` (evaluation), `postuler.md` (apply), `pipeline.md`.
 - **Japanese (Japan market):** `modes/ja/` — native Japanese translations with Japan-specific vocabulary (正社員, 業務委託, 賞与, 退職金, みなし残業, 年俸制, 36協定, 通勤手当, 住宅手当, etc.). Includes `_shared.md`, `kyujin.md` (evaluation), `oubo.md` (apply), `pipeline.md`.
 - **Turkish (Turkey market):** `modes/tr/` — native Turkish translations with Turkey-specific vocabulary (SGK, kıdem tazminatı, ihbar süresi, brüt/net maaş, AGİ, BES, yemek kartı, yol yardımı, TÜFE zammı, etc.). Includes `_shared.md`, `is-ilani.md` (evaluation), `basvuru.md` (apply), `pipeline.md`.
+- **Portuguese (Brazil/Portugal market):** `modes/pt/` — native Portuguese translations. Includes `_shared.md`, `oferta.md` (evaluation), `aplicar.md` (apply), `pipeline.md`.
+- **Russian (Russia/CIS market):** `modes/ru/` — native Russian translations. Includes `_shared.md`, `oferta.md` (evaluation), `apply.md`, `interview-prep.md`, `pipeline.md`.
+- **Ukrainian (Ukraine market):** `modes/ua/` — native Ukrainian translations. Includes `_shared.md`, `oferta.md` (evaluation), `apply.md`, `interview-prep.md`, `pipeline.md`.
 
 **When to use German modes:** If the user is targeting German-language job postings, lives in DACH, or asks for German output. Either:
 1. User says "use German modes" → read from `modes/de/` instead of `modes/`
@@ -207,6 +210,7 @@ Default modes are in `modes/` (English). Additional language-specific modes are 
 | Asks for company research | `deep` |
 | Preps for interview at specific company | `interview-prep` |
 | Wants to generate CV/PDF | `pdf` |
+| Wants to export CV as LaTeX/Overleaf | `latex` |
 | Evaluates a course/cert | `training` |
 | Evaluates portfolio project | `project` |
 | Asks about application status | `tracker` |

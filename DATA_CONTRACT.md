@@ -45,13 +45,21 @@ These files contain system logic, scripts, templates, and instructions that impr
 | `modes/training.md` | Training evaluation instructions |
 | `modes/patterns.md` | Pattern analysis instructions |
 | `modes/followup.md` | Follow-up cadence instructions |
+| `modes/interview-prep.md` | Interview prep instructions |
+| `modes/latex.md` | LaTeX CV export instructions |
+| `modes/update.md` | System update instructions |
 | `modes/de/*` | German language modes |
 | `modes/fr/*` | French language modes |
 | `modes/ja/*` | Japanese language modes |
 | `modes/pt/*` | Portuguese language modes |
 | `modes/ru/*` | Russian language modes |
-| `CLAUDE.md` | Agent instructions |
-| `AGENTS.md` | Codex instructions |
+| `modes/tr/*` | Turkish language modes |
+| `modes/ua/*` | Ukrainian language modes |
+| `CLAUDE.md` | Agent instructions (Claude Code) |
+| `AGENTS.md` | Agent instructions (canonical) |
+| `GEMINI.md` | Agent instructions (Gemini CLI) |
+| `providers/` | ATS API provider modules |
+| `.agents/` | Agent skill definitions (multi-CLI) |
 | `*.mjs` | Utility scripts |
 | `batch/batch-prompt.md` | Batch worker prompt |
 | `batch/batch-runner.sh` | Batch orchestrator |
