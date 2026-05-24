@@ -36,12 +36,17 @@ npx playwright install chromium
 | Multiple offers | `modes/_shared.md` + `modes/ofertas.md` |
 | Portal scan | `modes/_shared.md` + `modes/scan.md` |
 | PDF generation | `modes/_shared.md` + `modes/pdf.md` |
+| LaTeX CV export | `modes/_shared.md` + `modes/latex.md` |
 | Live application help | `modes/_shared.md` + `modes/apply.md` |
 | Pipeline inbox processing | `modes/_shared.md` + `modes/pipeline.md` |
 | Tracker status | `modes/tracker.md` |
 | Deep company research | `modes/deep.md` |
 | Training / certification review | `modes/training.md` |
 | Project evaluation | `modes/project.md` |
+| Rejection patterns / targeting | `modes/patterns.md` |
+| Follow-up cadence | `modes/followup.md` |
+| Interview prep | `modes/interview-prep.md` |
+| System update | `modes/update.md` |
 
 The key point: Codex support is additive. It should route into the existing
 Career-Ops modes and scripts rather than introducing a parallel automation

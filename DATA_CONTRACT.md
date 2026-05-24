@@ -18,6 +18,7 @@ These files contain your personal data, customizations, and work product. Update
 | `data/pipeline.md` | Your URL inbox |
 | `data/scan-history.tsv` | Your scan history |
 | `data/follow-ups.md` | Your follow-up history |
+| `writing-samples/*` | Your personal writing samples for style calibration (except `writing-samples/README.md`, which is system-owned documentation delivered by updates) |
 | `reports/*` | Your evaluation reports |
 | `output/*` | Your generated PDFs |
 | `jds/*` | Your saved job descriptions |
@@ -44,9 +45,21 @@ These files contain system logic, scripts, templates, and instructions that impr
 | `modes/training.md` | Training evaluation instructions |
 | `modes/patterns.md` | Pattern analysis instructions |
 | `modes/followup.md` | Follow-up cadence instructions |
+| `modes/interview-prep.md` | Interview prep instructions |
+| `modes/latex.md` | LaTeX CV export instructions |
+| `modes/update.md` | System update instructions |
 | `modes/de/*` | German language modes |
-| `CLAUDE.md` | Agent instructions |
-| `AGENTS.md` | Codex instructions |
+| `modes/fr/*` | French language modes |
+| `modes/ja/*` | Japanese language modes |
+| `modes/pt/*` | Portuguese language modes |
+| `modes/ru/*` | Russian language modes |
+| `modes/tr/*` | Turkish language modes |
+| `modes/ua/*` | Ukrainian language modes |
+| `CLAUDE.md` | Agent instructions (Claude Code) |
+| `AGENTS.md` | Agent instructions (canonical) |
+| `GEMINI.md` | Agent instructions (Gemini CLI) |
+| `providers/` | ATS API provider modules |
+| `.agents/` | Agent skill definitions (multi-CLI) |
 | `*.mjs` | Utility scripts |
 | `batch/batch-prompt.md` | Batch worker prompt |
 | `batch/batch-runner.sh` | Batch orchestrator |
@@ -57,6 +70,7 @@ These files contain system logic, scripts, templates, and instructions that impr
 | `docs/*` | Documentation |
 | `VERSION` | Current version number |
 | `DATA_CONTRACT.md` | This file |
+| `writing-samples/README.md` | System-owned onboarding documentation for the writing-samples directory |
 
 ## The Rule
 
