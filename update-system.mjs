@@ -123,6 +123,8 @@ const SYSTEM_PATHS = [
   'liveness-browser.mjs',
   'analyze-patterns.mjs',
   'detect-reposts.mjs',
+  'process-quality.mjs',
+  'process-quality.test.mjs',
   'followup-cadence.mjs',
   'followup-cadence.test.mjs',
   'agent-inbox.mjs',
