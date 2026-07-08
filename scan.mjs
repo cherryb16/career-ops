@@ -30,11 +30,9 @@
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { pathToFileURL, fileURLToPath } from 'url';
 import path from 'path';
-import yaml from 'js-yaml';
+import { load as parseYaml } from 'js-yaml';
 
 import { makeHttpCtx } from './providers/_http.mjs';
-
-const parseYaml = yaml.load;
 
 // ── Config ──────────────────────────────────────────────────────────
 
