@@ -111,6 +111,18 @@ function parseMarkdownJobs(markdown, fallbackCompany) {
 export default {
   id: 'management-consulted',
 
+  detect(entry) {
+    if (entry.provider === 'management-consulted') return { url: entry.api || entry.careers_url };
+    if (!entry.careers_url) return null;
+    try {
+      const url = new URL(entry.careers_url);
+      if (url.hostname === 'jobs.managementconsulted.com') return { url: entry.careers_url };
+    } catch {
+      return null;
+    }
+    return null;
+  },
+
   async fetch(entry, ctx) {
     const maxPages = resolveMaxPages(entry);
     const fallbackCompany = entry?.name || 'Management Consulted';
@@ -118,13 +130,15 @@ export default {
 
     for (let page = 1; page <= maxPages; page++) {
       try {
-        const markdown = await fetchPage(ctx, page);
+        const url = page === 1 ? JINA_BASE : `${JINA_BASE}?page=${page}`;
+        assertJinaUrl(url);
+        const markdown = await ctx.fetchText(url, { redirect: 'error' });
         const jobs = parseMarkdownJobs(markdown, fallbackCompany);
-        
+
         if (jobs.length === 0) break; // No more jobs on this page
-        
+
         allJobs.push(...jobs);
-        
+
         // If we got fewer jobs than expected, might be last page
         if (jobs.length < 20) break;
       } catch (err) {
