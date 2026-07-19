@@ -28,12 +28,14 @@ These files contain your personal data, customizations, and work product. Update
 | `data/pipeline.md` | Your URL inbox |
 | `data/scan-history.tsv` | Your scan history (9 tab-separated columns; col 8: local SimHash JD fingerprint for cross-listing detection, col 9: posting date) |
 | `data/scan-runs.tsv` | Your per-run scan counters (appended by `scan.mjs`, read by `stats.mjs`) |
+| `data/portal-health.tsv` | Consecutive reachability status for scanned portals (appended by `scan.mjs`) |
 | `data/follow-ups.md` | Your follow-up history |
 | `data/offers/*` | Your received offers/contracts, promise notes, prep reports, and reply drafts (PII — gitignored, written by the `offer-prep` mode) |
 | `data/salary-observations.tsv` | Your append-only compensation observation log: `{tracker#}\t{date}\t{desired\|advertised\|actual}\t{amount}\t{currency}\t{source}\t{note}`. Written by interactive modes when a figure is stated/confirmed; never edited in place. Advertised figures come from reports' `advertised_comp` instead — reports are themselves observation sources. Read by `salary-gap.mjs` |
 | `data/status-log.tsv` | Your append-only status transition ledger: `{tracker#}\t{date}\t{from}\t{to}\t{source}\t{note}`. Appended by `set-status.mjs` on every real status change (the tracker stays the source of truth for *state*; the ledger records *when* transitions happened; the `set-status.mjs` append path lands with #1695 — until then this file may simply not exist); never edited in place — corrections are new `correction`-source lines. Read by `funnel-velocity.mjs` |
 | `data/upskill/*` | Your skill-gap analysis reports (written by the `upskill` mode) |
 | `data/blacklist.md` | Your do-not-apply company list (opt-in — absence = no filtering; never auto-populated: only you, or the agent on your explicit instruction, write to it. Respected by `scan.mjs` and the `auto-pipeline`/`oferta`/`apply` gates; never a scoring input) |
+| `data/assessments.tsv` | Your append-only skills-assessment log: `{date}\t{company}\t{report#\|-}\t{platform}\t{subject}\t{threshold%\|-}\t{score%\|-}\t{stale_note}`. Appended by `node assessment-log.mjs add`; never edited in place. Empty stale_note = no staleness observed. Read by `assessment-log.mjs` |
 | `writing-samples/*` | Your personal writing samples for style calibration (except `writing-samples/README.md`, which is system-owned documentation delivered by updates) |
 | `reports/*` | Your evaluation reports |
 | `output/*` | Your generated PDFs |

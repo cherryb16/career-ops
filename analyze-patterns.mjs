@@ -43,9 +43,12 @@ const MACHINE_SUMMARY_FIELDS = new Set([
   'seniority',
   'remote',
   'team_size',
+  // Issue 1380: predicted skip/discard reasons from the agent.
+  'discard_reasons',
   'advertised_comp',
   'via',
   'company_confidential',
+  'risk_summary',
 ]);
 
 // --- CLI args ---
@@ -215,6 +218,38 @@ company_confidential: true
   if (summary?.via !== 'Hays') failures.push('via was not preserved from Machine Summary');
   if (summary?.company_confidential !== true) failures.push('company_confidential boolean was not preserved from Machine Summary');
 
+  // Backward compat (#1737): summaries without risk_summary parse as before, key simply absent.
+  if ('risk_summary' in (summary ?? {})) failures.push('summary without risk_summary must not gain the key');
+
+  // risk_summary preservation (#1737): the nested map must survive the
+  // MACHINE_SUMMARY_FIELDS allowlist intact — nested keys preserved, not
+  // flattened or dropped.
+  const riskSummary = parseMachineSummary(`
+## Machine Summary
+
+\`\`\`yaml
+company: "Acme"
+role: "Staff AI Engineer"
+score: 4.4
+legitimacy_tier: "High Confidence"
+risk_summary:
+  legitimacy: high_confidence
+  classification: clear
+  culture: caution
+  interview_redflags: not_evaluated
+  ai_infra: not_evaluated
+\`\`\`
+`)?.risk_summary;
+  if (!riskSummary || typeof riskSummary !== 'object' || Array.isArray(riskSummary)) {
+    failures.push('risk_summary nested map was dropped or not parsed as a map');
+  } else {
+    if (riskSummary.legitimacy !== 'high_confidence') failures.push('risk_summary.legitimacy was not preserved');
+    if (riskSummary.classification !== 'clear') failures.push('risk_summary.classification was not preserved');
+    if (riskSummary.culture !== 'caution') failures.push('risk_summary.culture was not preserved');
+    if (riskSummary.interview_redflags !== 'not_evaluated') failures.push('risk_summary.interview_redflags was not preserved');
+    if (riskSummary.ai_infra !== 'not_evaluated') failures.push('risk_summary.ai_infra was not preserved');
+  }
+
   // Vendor detection (community ATS only; white-labeled → null)
   const vendorCases = [
     ['https://boards.greenhouse.io/acme/jobs/12345', 'greenhouse'],
@@ -310,6 +345,7 @@ function parseReport(reportPath) {
     confidence: null,
     nextAction: null,
     topStrengths: [],
+    discardReasons: [],
     scores: {},
     gaps: [],
   };
@@ -330,6 +366,7 @@ function parseReport(reportPath) {
     report.confidence = normalizeScalar(machineSummary.confidence) || report.confidence;
     report.nextAction = normalizeScalar(machineSummary.next_action) || report.nextAction;
     report.topStrengths = normalizeList(machineSummary.top_strengths);
+    report.discardReasons = normalizeList(machineSummary.discard_reasons);
 
     if (typeof machineSummary.score === 'number') {
       report.scores.global = machineSummary.score;
@@ -732,6 +769,42 @@ function analyze() {
       : 'N/A',
   };
 
+  // --- Generate recommendations ---
+  const recommendations = [];
+
+  // --- Discard reason analysis (Issue 1380) ---
+
+  // Aggregates user-committed `DISCARD: <reason>` or `SKIP: <reason>` tags in the Notes column.
+  const discardReasonCounts = new Map();
+  for (const e of enriched) {
+    if (e.outcome !== 'self_filtered' && e.outcome !== 'negative') continue;
+    // From tracker Notes column: "DISCARD: <reason>" or "SKIP: <reason>"
+    const notesMatch = (e.notes || '').match(/(?:DISCARD|SKIP):\s*([^,;\n]+)/gi);
+    if (notesMatch) {
+      for (const m of notesMatch) {
+        const key = m.replace(/^(?:DISCARD|SKIP):\s*/i, '').trim().toLowerCase();
+        if (key) discardReasonCounts.set(key, (discardReasonCounts.get(key) || 0) + 1);
+      }
+    }
+  }
+  const discardReasonStats = [...discardReasonCounts.entries()]
+    .map(([reason, frequency]) => ({
+      reason,
+      frequency,
+      percentage: Math.round((frequency / enriched.length) * 100),
+    }))
+    .sort((a, b) => b.frequency - a.frequency);
+
+  // Recommend updating _custom.md when a single reason dominates
+  const topDiscardReason = discardReasonStats[0];
+  if (topDiscardReason && topDiscardReason.frequency >= Math.max(3, Math.ceil(enriched.length * 0.15))) {
+    recommendations.push({
+      action: `Add "${topDiscardReason.reason}" filter to modes/_custom.md to avoid wasting evaluation effort`,
+      reasoning: `"${topDiscardReason.reason}" is the most frequent discard reason (${topDiscardReason.frequency}x, ${topDiscardReason.percentage}% of all applications).`,
+      impact: 'high',
+    });
+  }
+
   // --- Tech stack gaps (from negative + self_filtered outcomes) ---
   // Canonical spellings keyed by lowercased match — the /i regex below returns
   // the source casing ("react native", "NODEJS"), and without this map each
@@ -765,9 +838,6 @@ function analyze() {
     .map(([skill, frequency]) => ({ skill, frequency }))
     .sort((a, b) => b.frequency - a.frequency)
     .slice(0, 15);
-
-  // --- Generate recommendations ---
-  const recommendations = [];
 
   // Geo-restriction recommendation
   const geoBlocker = blockerAnalysis.find(b => b.blocker === 'geo-restriction');
@@ -884,6 +954,7 @@ function analyze() {
     viaChannelAnalysis,
     scoreThreshold,
     techStackGaps,
+    discardReasonStats,
     recommendations,
   };
 }
@@ -895,7 +966,7 @@ function printSummary(result) {
     return;
   }
 
-  const { metadata, funnel, scoreComparison, archetypeBreakdown, blockerAnalysis, remotePolicy, scoreThreshold, techStackGaps, recommendations } = result;
+  const { metadata, funnel, scoreComparison, archetypeBreakdown, blockerAnalysis, remotePolicy, scoreThreshold, techStackGaps, discardReasonStats, recommendations } = result;
 
   console.log(`\n${'='.repeat(60)}`);
   console.log(`  Pattern Analysis — ${metadata.analysisDate}`);
@@ -944,6 +1015,15 @@ function printSummary(result) {
     console.log('-'.repeat(40));
     for (const g of techStackGaps.slice(0, 10)) {
       console.log(`  ${g.skill.padEnd(20)} ${g.frequency}x`);
+    }
+  }
+
+  // Discard reasons
+  if (discardReasonStats && discardReasonStats.length > 0) {
+    console.log('\nTOP DISCARD / SKIP REASONS');
+    console.log('-'.repeat(40));
+    for (const d of discardReasonStats.slice(0, 10)) {
+      console.log(`  ${d.reason.padEnd(30)} ${String(d.frequency).padStart(2)}x (${d.percentage}%)`);
     }
   }
 

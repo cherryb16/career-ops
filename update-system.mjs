@@ -129,6 +129,7 @@ const SYSTEM_PATHS = [
   'patch-latex-content.mjs',
   'lib/latex-escape.mjs',
   'lib/latex-content.mjs',
+  'img-to-pdf.mjs',
   'archive-posting.mjs',
   'application-answers.mjs',
   'generate-cover-letter.mjs',
@@ -155,6 +156,7 @@ const SYSTEM_PATHS = [
   'classify-tier.mjs',
   'scan-ats-full.mjs',
   'match-star.mjs',
+  'jd-skill-gap.mjs',
   'prepare-application.mjs',
   'providers/',
   'seeds/',
@@ -174,6 +176,7 @@ const SYSTEM_PATHS = [
   'process-quality.test.mjs',
   'salary-gap.mjs',
   'funnel-velocity.mjs',
+  'assessment-log.mjs',
   'followup-cadence.mjs',
   'followup-cadence.test.mjs',
   'invite-match.mjs',
@@ -185,6 +188,8 @@ const SYSTEM_PATHS = [
   'ollama-eval.mjs',
   'openai-eval.mjs',
   'openai-tailor.mjs',
+  'eval-golden.mjs',
+  'evals/',
   'openrouter-runner.mjs',
   'test-all.mjs',
   'detect-reposts.test.mjs',
@@ -199,6 +204,8 @@ const SYSTEM_PATHS = [
   'reply-matcher.mjs',
   'reply-matcher.test.mjs',
   'reply-watch.mjs',
+  'paste-reply.mjs',
+  'paste-reply-tests.mjs',
   'batch/batch-prompt.md',
   'batch/batch-runner.sh',
   'batch/README.md',
@@ -223,6 +230,9 @@ const SYSTEM_PATHS = [
   'writing-samples/README.md',
   'VERSION',
   'DATA_CONTRACT.md',
+  'MANIFESTO.md',
+  'manifesto.mjs',
+  'SIGNATURES.md',
   'CONTRIBUTING.md',
   'MAINTAINERS.md',
   'ARCHITECTURE.md',
@@ -255,6 +265,10 @@ const SYSTEM_PATHS = [
   '.github/',
   'package.json',
   'build-cv-latex.mjs',
+  'build-cv-html.mjs',
+  'cv-templates.mjs',
+  'test/cv-templates.test.mjs',
+  'test/cover-resolver.test.mjs',
   'scaffolder/',
   'Dockerfile',
   'docker-compose.yml',
@@ -938,13 +952,14 @@ async function apply() {
 
     // 7. Commit the update
     const remote = localVersion(); // Re-read after checkout updated VERSION
+    const pathsToStage = [...updated];
+    const dismissFile = join(ROOT, '.update-dismissed');
+    if (existsSync(dismissFile)) {
+      unlinkSync(dismissFile);
+      pathsToStage.push('.update-dismissed');
+    }
+
     try {
-      const pathsToStage = [...updated];
-      const dismissFile = join(ROOT, '.update-dismissed');
-      if (existsSync(dismissFile)) {
-        unlinkSync(dismissFile);
-        pathsToStage.push('.update-dismissed');
-      }
       prepareMaterializedSkillEntrypointsForStage(materializedSkillEntrypoints);
       addPaths(pathsToStage);
       // Scope the commit to only the staged update paths (#915 bug 2).
@@ -952,13 +967,38 @@ async function apply() {
       // the update commit. Passing the explicit pathspec list constrains the
       // commit to exactly the files this update touched.
       git('commit', '-m', `chore: auto-update system files to v${remote}`, '--', ...pathsToStage);
-    } catch {
-      // Nothing to commit (already up to date)
+    } catch (e) {
+      let commitFailed = false;
+      try {
+        const entries = gitStatusEntries();
+        const changedPaths = new Set(entries.map(entry => entry.path));
+        const allTargetPaths = [...pathsToStage, ...materializedSkillEntrypoints];
+        commitFailed = allTargetPaths.some(p => changedPaths.has(p));
+      } catch (err) {
+        commitFailed = true;
+      }
+
+      if (commitFailed) {
+        const allTargetPaths = [...pathsToStage, ...materializedSkillEntrypoints];
+        const pathspec = allTargetPaths.map(p => `"${p}"`).join(' ');
+        throw new Error(
+          `Update commit failed (files may be staged but not committed).\n` +
+          `    Error: ${e.message.split('\n')[0]}\n` +
+          `    Please run manually to finish the update:\n` +
+          `    git commit -m "chore: auto-update system files to v${remote}" -- ${pathspec}`
+        );
+      }
+      // Otherwise, genuinely nothing to commit (already up to date)
     }
 
     console.log(`\nUpdate complete: v${local} → v${remote}`);
     console.log(`Updated ${updated.length} system paths.`);
     console.log(`Rollback available: node update-system.mjs rollback`);
+
+    console.log('\n-- The CareerOps Manifesto ------------------------------');
+    console.log('A new way of job searching is taking shape. You are');
+    console.log('already practicing it. Read it, sign it if you want to help:');
+    console.log('    npm run manifesto  ·  https://career-ops.org/manifesto?utm_source=updater');
 
   } finally {
     // Remove lock
