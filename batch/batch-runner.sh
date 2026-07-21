@@ -31,6 +31,7 @@ MAIN_PID="${BASHPID:-$$}"
 
 # Defaults
 PARALLEL=1
+CLI="agy"
 DRY_RUN=false
 RETRY_FAILED=false
 RESUME_PAUSED=false
@@ -54,16 +55,17 @@ is_decimal_number() {
 
 usage() {
   cat <<'USAGE'
-career-ops batch runner — process job offers in batch via claude -p workers
+career-ops batch runner — process job offers in batch via headless workers (default: hermes)
 Uses spend_tier from config/profile.yml unless --model overrides it.
 
 Usage: batch-runner.sh [OPTIONS]
 
 Options:
+  --cli NAME           Worker CLI: hermes, agy, or claude (default: agy)
   --parallel N         Number of parallel workers (default: 1)
   --dry-run            Show what would be processed, don't execute
   --retry-failed       Only retry offers marked as "failed" in state
-  --resume-paused      Resume offers paused by a Claude session/rate limit
+  --resume-paused      Resume offers paused by a session/rate limit
   --start-from N       Start from offer ID N (skip earlier IDs)
   --limit N            Max number of offers to process in this run
   --max-retries N      Max retry attempts per offer (default: 2)
@@ -71,8 +73,7 @@ Options:
   --skip-pdf           Skip PDF generation entirely (write ❌ in tracker PDF column)
   --rate-limit-sleep N Seconds to wait before retrying a rate-limited worker
                        (default: 300)
-  --model NAME         Override the tier-resolved Claude model passed to
-                       `claude -p --model` (otherwise uses config/profile.yml
+  --model NAME         Override the tier-resolved model (otherwise uses config/profile.yml
                        spend_tier: economy/standard/premium; default standard)
   --status             Show batch progress and a per-job table, then exit
   --watch              Live-refresh progress until the run completes
@@ -118,6 +119,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --model) MODEL="$2"; shift 2 ;;
+    --cli) CLI="$2"; shift 2 ;;
     --status) STATUS_ONLY=true; shift ;;
     --watch) WATCH_MODE=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -178,10 +180,33 @@ check_prerequisites() {
     exit 1
   fi
 
-  if ! command -v claude &>/dev/null; then
-    echo "ERROR: 'claude' CLI not found in PATH."
-    exit 1
-  fi
+  # Validate the selected CLI binary exists
+  case "$CLI" in
+    hermes)
+      if ! command -v hermes >/dev/null 2>&1; then
+        echo "ERROR: 'hermes' CLI not found in PATH. Install Hermes or use --cli claude."
+        exit 1
+      fi
+      ;;
+    agy)
+      AGY_CLI="/Users/mac_studio/.local/bin/agy"
+      if [[ ! -x "$AGY_CLI" ]]; then
+        echo "ERROR: 'agy' CLI not found at $AGY_CLI"
+        exit 1
+      fi
+      ;;
+    claude)
+      CLAUDE_CLI="/Users/mac_studio/.local/bin/claude"
+      if [[ ! -x "$CLAUDE_CLI" ]]; then
+        echo "ERROR: 'claude' CLI not found at $CLAUDE_CLI"
+        exit 1
+      fi
+      ;;
+    *)
+      echo "ERROR: Unsupported --cli '$CLI'. Supported: hermes, agy, claude"
+      exit 1
+      ;;
+  esac
 
   mkdir -p "$LOGS_DIR" "$TRACKER_DIR" "$REPORTS_DIR"
 }
@@ -548,18 +573,53 @@ process_offer() {
     fi
   done
 
-  # Launch claude -p worker.
+  # Launch worker (dispatches based on --cli flag).
   # The model is resolved once per run from spend_tier unless --model was
   # passed. Building the command in an array keeps quoting safe regardless.
-  # --strict-mcp-config (with no --mcp-config) starts workers with no MCP
-  # servers: they only evaluate offers and need none. Without it each parallel
-  # worker inherits the parent session's MCP (e.g. Playwright) and they deadlock
-  # fighting over the single shared browser when --parallel > 1 (issue #506).
-  local -a claude_args=(-p --dangerously-skip-permissions --strict-mcp-config)
-  if [[ -n "$RESOLVED_MODEL" ]]; then
-    claude_args+=(--model "$RESOLVED_MODEL")
-  fi
-  claude_args+=(--append-system-prompt-file "$resolved_prompt" "$prompt")
+  # For Hermes: -z = one-shot mode (prints only final response), --yolo = bypass
+  # approvals (like claude's --dangerously-skip-permissions), --accept-hooks =
+  # auto-approve shell hooks for headless runs. AGENTS.md is auto-loaded from CWD
+  # by Hermes, so we pass the resolved prompt as the oneshot payload.
+  # For Claude: -p = oneshot, --dangerously-skip-permissions = bypass approvals,
+  # --strict-mcp-config = no MCP servers (avoids Playwright deadlock with --parallel > 1).
+  local -a worker_args=()
+  case "$CLI" in
+    hermes)
+      # Hermes one-shot payload: resolved prompt (with templates filled + user-layer
+      # files appended) + the actual prompt. We embed both as the oneshot message.
+      local payload
+      payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
+      worker_args=(-z "$payload" --yolo --accept-hooks)
+      # Use OpenRouter with a tool-capable model. The local Darkbloom 20B model
+      # cannot do tool calling (read_file, write_file, web_search, terminal),
+      # which the batch worker requires for the A-G evaluation pipeline.
+      worker_args+=(--provider openrouter --model z-ai/glm-5.2)
+      # Ensure required toolsets are enabled (web search, file ops, terminal, browser, code)
+      worker_args+=(-t web,file,terminal,browser,code_execution)
+      ;;
+    agy)
+      # Antigravity CLI: -p = print mode (non-interactive), --dangerously-skip-permissions
+      # = auto-approve all tool requests. Uses Gemini models (default: Gemini 3.5 Flash High).
+      # AGY auto-loads AGENTS.md from CWD. The resolved prompt is passed as the prompt text.
+      local agy_payload
+      agy_payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
+      worker_args=(-p "$agy_payload" --dangerously-skip-permissions)
+      # Use Gemini 3.5 Flash (Medium) — fast, tool-capable, cost-effective
+      worker_args+=(--model "Gemini 3.5 Flash (Medium)")
+      # Increase print timeout to 15 minutes for complex multi-step evaluations
+      worker_args+=(--print-timeout 15m)
+      # Per-worker log file for debugging
+      worker_args+=(--log-file "$LOGS_DIR/${report_num}-${id}-agy.log")
+      ;;
+    claude|*)
+      # Default: Claude Code
+      worker_args=(-p --dangerously-skip-permissions --strict-mcp-config)
+      if [[ -n "$RESOLVED_MODEL" ]]; then
+        worker_args+=(--model "$RESOLVED_MODEL")
+      fi
+      worker_args+=(--append-system-prompt-file "$resolved_prompt" "$prompt")
+      ;;
+  esac
 
   local exit_code=0
   local terminal_failure_recorded=false
@@ -567,19 +627,37 @@ process_offer() {
   local max_shim_retries=4
   while true; do
     exit_code=0
-    claude "${claude_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+    case "$CLI" in
+      hermes)
+        hermes "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        ;;
+      agy)
+        /Users/mac_studio/.local/bin/agy "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        ;;
+      claude|*)
+        /Users/mac_studio/.local/bin/claude "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        ;;
+    esac
 
     if [[ $exit_code -eq 0 ]]; then
       break
     fi
 
-    # Check for Claude Code npm shim swap (exit code 127 + command not found)
-    if [[ $exit_code -eq 127 ]] && grep -qE "(claude: command not found|claude:.*not found|cannot find.*claude)" "$log_file" && (( shim_retries < max_shim_retries )); then
-      shim_retries=$((shim_retries + 1))
-      echo "    ⏳ Claude command not found (shim swap detected). Retrying in 30s (attempt $shim_retries/$max_shim_retries)..."
-      sleep 30
-      continue
-    fi
+    # Check for CLI-specific transient errors
+    case "$CLI" in
+      hermes)
+        # Hermes-specific retry logic can be added here if needed
+        ;;
+      claude|*)
+        # Check for Claude Code npm shim swap (exit code 127 + command not found)
+        if [[ $exit_code -eq 127 ]] && grep -qE "(claude: command not found|claude:.*not found|cannot find.*claude)" "$log_file" && (( shim_retries < max_shim_retries )); then
+          shim_retries=$((shim_retries + 1))
+          echo "    ⏳ Claude command not found (shim swap detected). Retrying in 30s (attempt $shim_retries/$max_shim_retries)..."
+          sleep 30
+          continue
+        fi
+        ;;
+    esac
 
     if is_session_limit_log "$log_file"; then
       mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
@@ -607,6 +685,7 @@ process_offer() {
     break
   done
 
+  # Cleanup resolved prompt
   # Cleanup resolved prompt
   rm -f "$resolved_prompt"
 
@@ -692,12 +771,6 @@ print_summary() {
     local avg
     avg=$(awk -v sum="$score_sum" -v count="$score_count" 'BEGIN{printf "%.1f", sum / count}' 2>/dev/null || echo "N/A")
     echo "Average score: $avg/5 ($score_count scored)"
-  fi
-
-  if [[ -f "$BATCH_DIR/aggregate-tokens.mjs" ]]; then
-    if ! node "$BATCH_DIR/aggregate-tokens.mjs"; then
-      echo "Warning: token aggregation failed." >&2
-    fi
   fi
 }
 
@@ -825,6 +898,12 @@ main() {
   check_prerequisites
 
   resolve_worker_model
+
+  # For Hermes, we don't use the spend_tier model resolution - Hermes uses its own config.yaml
+  if [[ "$CLI" == "hermes" ]]; then
+    RESOLVED_MODEL="(uses Hermes config.yaml model)"
+    RESOLVED_SPEND_TIER="hermes"
+  fi
 
   if [[ "$DRY_RUN" == "false" ]]; then
     acquire_lock
