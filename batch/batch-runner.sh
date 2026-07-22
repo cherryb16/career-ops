@@ -10,22 +10,27 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BATCH_DIR="$SCRIPT_DIR"
-INPUT_FILE="$BATCH_DIR/batch-input.tsv"
-STATE_FILE="$BATCH_DIR/batch-state.tsv"
-PROMPT_FILE="$BATCH_DIR/batch-prompt.md"
+BATCH_DIR="${CAREER_OPS_BATCH:-$SCRIPT_DIR}"
 PROFILE_FILE="$PROJECT_DIR/config/profile.yml"
-LOGS_DIR="$BATCH_DIR/logs"
-DISCARD_LOG="$LOGS_DIR/discard.log"
-TRACKER_DIR="$BATCH_DIR/tracker-additions"
 REPORTS_DIR="$PROJECT_DIR/reports"
 APPLICATIONS_FILE="$PROJECT_DIR/data/applications.md"
-LOCK_FILE="$BATCH_DIR/batch-runner.pid"
-PAUSE_FILE="$BATCH_DIR/batch-runner.paused"
-STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
-STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
 STATE_LOCK_TIMEOUT_SECONDS=30
 MAIN_PID="${BASHPID:-$$}"
+
+sync_batch_paths() {
+  INPUT_FILE="$BATCH_DIR/batch-input.tsv"
+  STATE_FILE="$BATCH_DIR/batch-state.tsv"
+  PROMPT_FILE="$BATCH_DIR/batch-prompt.md"
+  LOGS_DIR="$BATCH_DIR/logs"
+  DISCARD_LOG="$LOGS_DIR/discard.log"
+  TRACKER_DIR="$BATCH_DIR/tracker-additions"
+  LOCK_FILE="$BATCH_DIR/batch-runner.pid"
+  PAUSE_FILE="$BATCH_DIR/batch-runner.paused"
+  STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
+  STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
+}
+sync_batch_paths
+
 
 # Defaults
 PARALLEL=1
@@ -102,6 +107,7 @@ USAGE
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --batch-dir) BATCH_DIR="$2"; shift 2 ;;
     --parallel) PARALLEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --retry-failed) RETRY_FAILED=true; shift ;;
@@ -124,6 +130,9 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
+
+sync_batch_paths
+
 
 if ! [[ "$RATE_LIMIT_SLEEP" =~ ^[0-9]+$ ]]; then
   echo "ERROR: --rate-limit-sleep must be a non-negative integer (seconds)."

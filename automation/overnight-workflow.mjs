@@ -180,7 +180,7 @@ export function parseResetTimestamp(logContent, now = new Date()) {
       candidates.push(date);
     } catch { /* invalid or unavailable IANA timezone is not reliable */ }
   }
-  const relativeRe = /(?:retry|try again|wait)\s+(?:after|in)\s+(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)/gi;
+  const relativeRe = /(?:retry|try again|wait|resets?)(?:\s+(?:after|in|for))?\s+(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b/gi;
   for (const match of logContent.matchAll(relativeRe)) {
     const unit = match[2].toLowerCase();
     const multiplier = unit.startsWith('h') ? 3_600_000 : unit.startsWith('m') ? 60_000 : 1_000;
@@ -257,7 +257,7 @@ export function convertPendingRolesToBatchInput(inputFile, roles, { dryRun = fal
     rows.push(row); byUrl.set(row.url, row); added.push(row);
   }
   const content = ['id\turl\tsource\tnotes', ...rows.map((r) => [r.id, r.url, r.source, r.notes].join('\t'))].join('\n') + '\n';
-  if (!dryRun && added.length) atomicWrite(inputFile, content);
+  if (!dryRun && (added.length || !existsSync(inputFile))) atomicWrite(inputFile, content);
   return { addedCount: added.length, totalOffers: rows.length, rows, added };
 }
 
@@ -323,7 +323,7 @@ function relativeToRoot(opts, file) { return file ? path.relative(opts.rootDir, 
 
 function parseDeadline(content, now) {
   const matches = [...content.matchAll(/(?:deadline|apply by|closing date)\s*:?\s*(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?)/gi)];
-  const dates = matches.map((m) => new Date(m[1].length === 10 ? `${m[1]}T23:59:59Z` : m[1])).filter((d) => !Number.isNaN(d));
+  const dates = matches.map((m) => new Date(m[1].length === 10 ? `${m[1]}T23:59:59Z` : m[1])).filter((d) => Number.isFinite(d.getTime()));
   if (!dates.length) return { deadline: null, urgent: false };
   const deadline = dates.sort((a, b) => a - b)[0];
   return { deadline: deadline.toISOString(), urgent: deadline >= now && deadline.getTime() - now.getTime() <= 172_800_000 };
@@ -333,7 +333,7 @@ function preparePassedReviewPackages(opts, rows, generationIds, generationId, er
   let draftReady = 0, missingArtifact = 0, urgentDeadline = 0;
   const packages = [];
   const packagesDir = path.join(opts.reportsDir, 'packages');
-  for (const row of rows.filter((item) => generationIds.has(item.id) && TERMINAL.has(item.status))) {
+  for (const row of rows.filter((item) => generationIds.has(item.id) && item.status === 'completed')) {
     const report = reportForRow(opts.reportsDir, row.report_num);
     if (!report) continue;
     const content = readFileSync(report, 'utf8');
@@ -460,7 +460,7 @@ export async function runOvernightWorkflow(input = {}) {
     const generationIds = new Set(generationRows.map((row) => row.id));
     const generationId = `gen_${hash(generationRows.map((row) => roleIdempotencyKey(row.url)).sort().join('\n') || 'empty')}`;
 
-    const runnerArgs = ['--cli', 'agy', '--parallel', '2', '--limit', '0', '--rate-limit-sleep', '0', '--resume-paused'];
+    const runnerArgs = ['--cli', 'agy', '--parallel', '2', '--limit', '0', '--rate-limit-sleep', '0', '--resume-paused', '--batch-dir', opts.batchDir];
     if (opts.dryRun) runnerArgs.push('--dry-run');
     const runner = runCommand(opts.runnerCommand, runnerArgs, { cwd: opts.rootDir });
     if (runner.status !== 0 && !/(?:paused|rate limit|session limit)/i.test(`${runner.stdout}\n${runner.stderr}`)) {
