@@ -298,7 +298,7 @@ writeFileSync(path.join(root, 'batch/batch-state.tsv'), 'id\\turl\\tstatus\\tsta
     writeFileSync(path.join(ws.batch, 'batch-prompt.md'), 'URL={{URL}}\nREPORT={{REPORT_NUM}}\n');
     const runner = spawnSync(path.join(ROOT, 'batch', 'batch-runner.sh'), [
       '--cli', 'agy', '--dry-run', '--batch-dir', ws.batch,
-    ], { cwd: ROOT, encoding: 'utf8', shell: false });
+    ], { cwd: ROOT, encoding: 'utf8', shell: false, env: { ...process.env, AGY_BIN: process.execPath } });
     check(runner.status === 0 && existsSync(path.join(ws.batch, 'batch-state.tsv'))
       && `${runner.stdout}\n${runner.stderr}`.includes(`No offers in ${path.join(ws.batch, 'batch-input.tsv')}`),
     'fallback shell runner reads and writes only the configured batch directory', `${runner.stdout}\n${runner.stderr}`);
