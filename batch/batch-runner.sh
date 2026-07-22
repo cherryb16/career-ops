@@ -65,6 +65,7 @@ Usage: batch-runner.sh [OPTIONS]
 
 Options:
   --cli NAME           Worker CLI: hermes, agy, or claude (default: agy)
+  --batch-dir PATH     Batch input, state, prompt, logs, and lock directory
   --parallel N         Number of parallel workers (default: 1)
   --dry-run            Show what would be processed, don't execute
   --retry-failed       Only retry offers marked as "failed" in state
@@ -107,7 +108,11 @@ USAGE
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --batch-dir) BATCH_DIR="$2"; shift 2 ;;
+    --batch-dir)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "ERROR: --batch-dir requires a path"; exit 1; }
+      BATCH_DIR="$2"
+      shift 2
+      ;;
     --parallel) PARALLEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --retry-failed) RETRY_FAILED=true; shift ;;

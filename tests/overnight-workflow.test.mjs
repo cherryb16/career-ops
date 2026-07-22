@@ -1,5 +1,6 @@
 import { pass, fail, ROOT } from './helpers.mjs';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { acquireLock, cardIdempotencyKey, classifySource, getNextPhoenix1AM, parsePipelinePendingRoles, parseResetTimestamp, roleIdempotencyKey, runOvernightWorkflow } from '../automation/overnight-workflow.mjs';
 import { generateDailyDigest } from '../automation/daily-digest.mjs';
@@ -287,6 +288,21 @@ writeFileSync(path.join(root, 'batch/batch-state.tsv'), 'id\\turl\\tstatus\\tsta
   } finally { ws.cleanup(); }
 }
 
+// Finding 5: The bundled fallback runner itself honors an argument-array custom batch directory.
+{
+  const ws = fixture();
+  try {
+    writeFileSync(path.join(ws.batch, 'batch-input.tsv'), 'id\turl\tsource\tnotes\n');
+    writeFileSync(path.join(ws.batch, 'batch-prompt.md'), 'URL={{URL}}\nREPORT={{REPORT_NUM}}\n');
+    const runner = spawnSync(path.join(ROOT, 'batch', 'batch-runner.sh'), [
+      '--cli', 'agy', '--dry-run', '--batch-dir', ws.batch,
+    ], { cwd: ROOT, encoding: 'utf8', shell: false });
+    check(runner.status === 0 && existsSync(path.join(ws.batch, 'batch-state.tsv'))
+      && `${runner.stdout}\n${runner.stderr}`.includes(`No offers in ${path.join(ws.batch, 'batch-input.tsv')}`),
+    'fallback shell runner reads and writes only the configured batch directory', `${runner.stdout}\n${runner.stderr}`);
+  } finally { ws.cleanup(); }
+}
+
 // Finding 4 & 6: Invalid deadlines do not throw RangeError; compact reset durations (60s, 30m, 2h) parse correctly.
 {
   const now = new Date('2026-07-21T00:00:00Z');
@@ -313,4 +329,3 @@ writeFileSync(path.join(root, 'batch/batch-state.tsv'), 'id\\turl\\tstatus\\tsta
 }
 
 if (failures) process.exitCode = 1;
-

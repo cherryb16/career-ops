@@ -1856,7 +1856,8 @@ if (
   batchPromptDoc.includes('Worker Output Contract for Apply Decisions') &&
   batchPromptDoc.includes('## Cover Letter Draft') &&
   batchPromptDoc.includes('## H) Draft Application Answers') &&
-  batchPromptDoc.includes('When `final_decision` is `Apply`, the report MUST contain useful drafts')
+  batchPromptDoc.includes('When `final_decision` is `Apply`, the report MUST contain useful drafts') &&
+  batchPromptDoc.includes('do not translate those three headings')
 ) {
   pass('batch workers inherit company-type compensation reliability checks and Apply output contract');
 } else {
