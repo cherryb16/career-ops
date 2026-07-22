@@ -139,7 +139,7 @@ writeFileSync(path.join(root, 'batch/batch-state.tsv'), 'id\\turl\\tstatus\\tsta
     const result = await runOvernightWorkflow({ ...ws.base, runnerCommand: ws.command(runner) });
     const args = JSON.parse(readFileSync(path.join(ws.root, 'runner-args.json'), 'utf8'));
     const inputRows = readFileSync(path.join(ws.batch, 'batch-input.tsv'), 'utf8').trim().split('\n').slice(1);
-    check(JSON.stringify(args) === JSON.stringify(['--cli','agy','--parallel','2','--limit','0','--rate-limit-sleep','0','--resume-paused']), 'runner receives exact AGY parallelism-2 unbounded drain arguments');
+    check(JSON.stringify(args) === JSON.stringify(['--cli','agy','--parallel','2','--limit','0','--rate-limit-sleep','0','--resume-paused','--batch-dir',ws.batch]), 'runner receives exact AGY parallelism-2 unbounded drain arguments');
     check(inputRows.length === 2 && result.evaluated === 2 && result.authenticated_blockers === 1, 'duplicates are idempotent, authenticated roles filter, and full backlog drains');
   } finally { ws.cleanup(); }
 }
@@ -245,4 +245,72 @@ writeFileSync(path.join(root, 'batch/batch-state.tsv'), 'id\\turl\\tstatus\\tsta
   check(!/\/Users\/[A-Za-z0-9._-]+\//.test(runner) && runner.includes('CLI="agy"'), 'tracked runner has AGY default and no user-specific executable path');
 }
 
+// Finding 2: Skipped/failed rows must NEVER create a review package even if an old report exists.
+{
+  const ws = fixture();
+  try {
+    const skippedUrl = 'https://jobs.lever.co/acme/skipped';
+    const failedUrl = 'https://jobs.lever.co/acme/failed';
+    writeFileSync(ws.base.pipelineFile, pipeline(
+      `- [ ] ${skippedUrl} | Acme | Skipped`,
+      `- [ ] ${failedUrl} | Acme | Failed`,
+    ));
+    writeFileSync(ws.base.stateFile, state([
+      `1\t${skippedUrl}\tskipped\t-\t-\t091\t2.0\tbelow-min-score\t0`,
+      `2\t${failedUrl}\tfailed\t-\t-\t092\t-\tapi-error\t1`,
+    ]));
+    // Even if old report files exist on disk for these numbers with Apply decisions:
+    writeFileSync(path.join(ws.reports, '091-skipped.md'), report({ decision: 'Apply' }));
+    writeFileSync(path.join(ws.reports, '092-failed.md'), report({ decision: 'Apply' }));
+    await runOvernightWorkflow(ws.base);
+    const packagesExist = existsSync(path.join(ws.reports, 'packages'));
+    const packageFiles = packagesExist ? readdirSync(path.join(ws.reports, 'packages')) : [];
+    check(packageFiles.length === 0, 'skipped and failed rows never create review packages even with existing reports');
+  } finally { ws.cleanup(); }
+}
+
+// Finding 3: Empty eligible queue must create header-only batch-input.tsv when missing; dry-run must remain write-free.
+{
+  const ws = fixture();
+  try {
+    writeFileSync(ws.base.pipelineFile, pipeline());
+    const batchInputPath = path.join(ws.batch, 'batch-input.tsv');
+    rmSync(batchInputPath, { force: true });
+    // Dry run first
+    await runOvernightWorkflow({ ...ws.base, dryRun: true });
+    check(!existsSync(batchInputPath), 'dry-run on empty queue leaves batch-input.tsv uncreated (write-free)');
+    // Real run
+    await runOvernightWorkflow({ ...ws.base, dryRun: false });
+    check(existsSync(batchInputPath), 'real run on empty queue creates header-only batch-input.tsv');
+    const content = readFileSync(batchInputPath, 'utf8');
+    check(content === 'id\turl\tsource\tnotes\n', 'created batch-input.tsv is header-only');
+  } finally { ws.cleanup(); }
+}
+
+// Finding 4 & 6: Invalid deadlines do not throw RangeError; compact reset durations (60s, 30m, 2h) parse correctly.
+{
+  const now = new Date('2026-07-21T00:00:00Z');
+  check(parseResetTimestamp('retry in 60s', now) === '2026-07-21T00:06:00.000Z', 'parseResetTimestamp parses 60s');
+  check(parseResetTimestamp('retry after 30m', now) === '2026-07-21T00:35:00.000Z', 'parseResetTimestamp parses 30m');
+  check(parseResetTimestamp('wait 2h', now) === '2026-07-21T02:05:00.000Z', 'parseResetTimestamp parses 2h');
+  check(parseResetTimestamp('resets in 2h', now) === '2026-07-21T02:05:00.000Z', 'parseResetTimestamp parses resets in 2h');
+
+  // Verify invalid deadline in workflow report does not throw RangeError
+  const ws = fixture();
+  try {
+    const url = 'https://jobs.lever.co/acme/invalid-deadline';
+    writeFileSync(ws.base.pipelineFile, pipeline(`- [ ] ${url} | Acme | Invalid Deadline`));
+    writeFileSync(ws.base.stateFile, state([`1\t${url}\tcompleted\t-\t-\t095\t4.8\t-\t0`]));
+    writeFileSync(path.join(ws.reports, '095-invalid-deadline.md'), report({ decision: 'Apply', deadline: '2026-13-01' }));
+    let threw = false;
+    try {
+      await runOvernightWorkflow(ws.base);
+    } catch {
+      threw = true;
+    }
+    check(!threw, 'invalid deadline 2026-13-01 does not throw RangeError');
+  } finally { ws.cleanup(); }
+}
+
 if (failures) process.exitCode = 1;
+

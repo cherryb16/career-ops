@@ -1852,12 +1852,17 @@ if (
   batchPromptDoc.includes('Expected stable cash') &&
   batchPromptDoc.includes('Non-cash benefits') &&
   batchPromptDoc.includes('When a salary figure exists, include 3-6 HR verification questions') &&
-  batchPromptDoc.includes('Do not present advertised compensation as real take-home pay')
+  batchPromptDoc.includes('Do not present advertised compensation as real take-home pay') &&
+  batchPromptDoc.includes('Worker Output Contract for Apply Decisions') &&
+  batchPromptDoc.includes('## Cover Letter Draft') &&
+  batchPromptDoc.includes('## H) Draft Application Answers') &&
+  batchPromptDoc.includes('When `final_decision` is `Apply`, the report MUST contain useful drafts')
 ) {
-  pass('batch workers inherit company-type compensation reliability checks');
+  pass('batch workers inherit company-type compensation reliability checks and Apply output contract');
 } else {
-  fail('batch prompt missing company-type compensation reliability checks');
+  fail('batch prompt missing company-type compensation reliability checks or Apply output contract');
 }
+
 
 const pipelineMode = readFile('modes/pipeline.md');
 if (

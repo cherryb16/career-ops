@@ -382,9 +382,19 @@ Then include:
 - `## F) Interview Plan`
 - `## G) Posting Legitimacy`
 - `## Risk Summary`
+- `## Cover Letter Draft`
+- `## H) Draft Application Answers`
 - `## Extracted Keywords`
 
+#### Worker Output Contract for Apply Decisions
+
+When `final_decision` is `Apply`, the report MUST contain useful drafts in the following exact sections:
+
+1. `## Cover Letter Draft`: a tailored cover letter draft including opening, profile introduction, key achievements from `cv.md` preserved verbatim with real metrics, company research placeholder, closing, flagged gaps, and ATS keywords to mirror.
+2. `## H) Draft Application Answers`: draft responses for standard application form questions (such as why this role, key relevant experience, salary expectations, notice period/availability, and work authorization/location).
+
 Translate these human-facing headings according to `language.output` when it is not English. Keep `## Machine Summary` and YAML keys exact for downstream parsers.
+
 
 ### Step 4 — Generate PDF (configurable)
 
