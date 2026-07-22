@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# career-ops batch runner — standalone orchestrator for claude -p workers
-# Reads batch-input.tsv, delegates each offer to a claude -p worker,
+# career-ops batch runner — standalone orchestrator for headless workers (default: agy)
+# Reads batch-input.tsv, delegates each offer to a worker CLI (agy, hermes, or claude),
 # tracks state in batch-state.tsv for resumability.
 #
-# NOTE: This script is Claude Code-specific. It uses claude -p with
-# --dangerously-skip-permissions and --append-system-prompt-file flags
-# that are not available in other CLIs. Multi-CLI support is out of scope
-# for now — contributions welcome.
+# NOTE: This script defaults to agy (Antigravity CLI) workers. Multi-CLI support
+# is available via the --cli flag (hermes, agy, or claude).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -55,7 +53,7 @@ is_decimal_number() {
 
 usage() {
   cat <<'USAGE'
-career-ops batch runner — process job offers in batch via headless workers (default: hermes)
+career-ops batch runner — process job offers in batch via headless workers (default: agy)
 Uses spend_tier from config/profile.yml unless --model overrides it.
 
 Usage: batch-runner.sh [OPTIONS]
@@ -189,16 +187,22 @@ check_prerequisites() {
       fi
       ;;
     agy)
-      AGY_CLI="/Users/mac_studio/.local/bin/agy"
-      if [[ ! -x "$AGY_CLI" ]]; then
-        echo "ERROR: 'agy' CLI not found at $AGY_CLI"
+      AGY_BIN="${AGY_BIN:-/Users/mac_studio/.local/bin/agy}"
+      if [[ ! -x "$AGY_BIN" ]] && command -v agy >/dev/null 2>&1; then
+        AGY_BIN="$(command -v agy)"
+      fi
+      if [[ ! -x "$AGY_BIN" ]]; then
+        echo "ERROR: 'agy' CLI not found at $AGY_BIN"
         exit 1
       fi
       ;;
     claude)
-      CLAUDE_CLI="/Users/mac_studio/.local/bin/claude"
-      if [[ ! -x "$CLAUDE_CLI" ]]; then
-        echo "ERROR: 'claude' CLI not found at $CLAUDE_CLI"
+      CLAUDE_BIN="${CLAUDE_BIN:-/Users/mac_studio/.local/bin/claude}"
+      if [[ ! -x "$CLAUDE_BIN" ]] && command -v claude >/dev/null 2>&1; then
+        CLAUDE_BIN="$(command -v claude)"
+      fi
+      if [[ ! -x "$CLAUDE_BIN" ]]; then
+        echo "ERROR: 'claude' CLI not found at $CLAUDE_BIN"
         exit 1
       fi
       ;;
@@ -632,10 +636,10 @@ process_offer() {
         hermes "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
       agy)
-        /Users/mac_studio/.local/bin/agy "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        "$AGY_BIN" "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
       claude|*)
-        /Users/mac_studio/.local/bin/claude "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        "$CLAUDE_BIN" "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
     esac
 
