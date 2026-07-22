@@ -55,7 +55,8 @@
     "overnight": "node automation/overnight-workflow.mjs",
     "digest": "node automation/daily-digest.mjs",
     "weekly-review": "node automation/weekly-review.mjs",
-    "exception-report": "node automation/exception-report.mjs"
+    "exception-report": "node automation/exception-report.mjs",
+    "test:overnight": "node tests/overnight-workflow.test.mjs"
   },
   "keywords": [
     "ai",

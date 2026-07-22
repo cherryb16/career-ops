@@ -63,7 +63,7 @@ Options:
   --parallel N         Number of parallel workers (default: 1)
   --dry-run            Show what would be processed, don't execute
   --retry-failed       Only retry offers marked as "failed" in state
-  --resume-paused      Resume offers paused by a session/rate limit
+  --resume-paused      Include paused offers while also draining normal backlog
   --start-from N       Start from offer ID N (skip earlier IDs)
   --limit N            Max number of offers to process in this run
   --max-retries N      Max retry attempts per offer (default: 2)
@@ -187,22 +187,16 @@ check_prerequisites() {
       fi
       ;;
     agy)
-      AGY_BIN="${AGY_BIN:-/Users/mac_studio/.local/bin/agy}"
-      if [[ ! -x "$AGY_BIN" ]] && command -v agy >/dev/null 2>&1; then
-        AGY_BIN="$(command -v agy)"
-      fi
-      if [[ ! -x "$AGY_BIN" ]]; then
-        echo "ERROR: 'agy' CLI not found at $AGY_BIN"
+      AGY_BIN="${AGY_BIN:-$(command -v agy 2>/dev/null || true)}"
+      if [[ -z "$AGY_BIN" || ! -x "$AGY_BIN" ]]; then
+        echo "ERROR: 'agy' CLI not found in PATH (or AGY_BIN is not executable)"
         exit 1
       fi
       ;;
     claude)
-      CLAUDE_BIN="${CLAUDE_BIN:-/Users/mac_studio/.local/bin/claude}"
-      if [[ ! -x "$CLAUDE_BIN" ]] && command -v claude >/dev/null 2>&1; then
-        CLAUDE_BIN="$(command -v claude)"
-      fi
-      if [[ ! -x "$CLAUDE_BIN" ]]; then
-        echo "ERROR: 'claude' CLI not found at $CLAUDE_BIN"
+      CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+      if [[ -z "$CLAUDE_BIN" || ! -x "$CLAUDE_BIN" ]]; then
+        echo "ERROR: 'claude' CLI not found in PATH (or CLAUDE_BIN is not executable)"
         exit 1
       fi
       ;;
@@ -961,11 +955,7 @@ main() {
     local status
     status=$(get_status "$id")
 
-    if [[ "$RESUME_PAUSED" == "true" ]]; then
-      if [[ "$status" != "paused_rate_limit" ]]; then
-        continue
-      fi
-    elif [[ "$RETRY_FAILED" == "true" ]]; then
+    if [[ "$RETRY_FAILED" == "true" ]]; then
       # Only process failed offers
       if [[ "$status" != "failed" ]]; then
         continue
@@ -982,8 +972,9 @@ main() {
       if [[ "$status" == "completed" || "$status" == "skipped" ]]; then
         continue
       fi
-      # Paused rate-limit offers resume explicitly with --resume-paused.
-      if [[ "$status" == "paused_rate_limit" ]]; then
+      # Paused rate-limit offers resume only when explicitly requested; the
+      # flag does not suppress new/failed backlog rows.
+      if [[ "$status" == "paused_rate_limit" && "$RESUME_PAUSED" != "true" ]]; then
         continue
       fi
       # Skip failed offers that hit retry limit (unless --retry-failed)
