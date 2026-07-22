@@ -13,7 +13,9 @@ let failures = 0;
 function check(condition, name, detail = '') { if (condition) pass(name); else { failures++; fail(`${name}${detail ? `: ${detail}` : ''}`); } }
 
 function fixture() {
-  const root = mkdtempSync(path.join(ROOT, 'tmp', 'overnight-'));
+  const tmpRoot = path.join(ROOT, 'tmp');
+  mkdirSync(tmpRoot, { recursive: true });
+  const root = mkdtempSync(path.join(tmpRoot, 'overnight-'));
   const dirs = Object.fromEntries(['data', 'batch', 'reports', 'output'].map((name) => [name, path.join(root, name)]));
   Object.values(dirs).forEach((dir) => mkdirSync(dir, { recursive: true }));
   const noop = path.join(root, 'noop.mjs');
