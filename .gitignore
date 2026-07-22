@@ -119,3 +119,6 @@ plan/
 
 # Web
 .career-ops-web/logo-cache/
+
+# Isolated agent worktrees
+/.worktrees/

@@ -1852,12 +1852,18 @@ if (
   batchPromptDoc.includes('Expected stable cash') &&
   batchPromptDoc.includes('Non-cash benefits') &&
   batchPromptDoc.includes('When a salary figure exists, include 3-6 HR verification questions') &&
-  batchPromptDoc.includes('Do not present advertised compensation as real take-home pay')
+  batchPromptDoc.includes('Do not present advertised compensation as real take-home pay') &&
+  batchPromptDoc.includes('Worker Output Contract for Apply Decisions') &&
+  batchPromptDoc.includes('## Cover Letter Draft') &&
+  batchPromptDoc.includes('## H) Draft Application Answers') &&
+  batchPromptDoc.includes('When `final_decision` is `Apply`, the report MUST contain useful drafts') &&
+  batchPromptDoc.includes('do not translate those three headings')
 ) {
-  pass('batch workers inherit company-type compensation reliability checks');
+  pass('batch workers inherit company-type compensation reliability checks and Apply output contract');
 } else {
-  fail('batch prompt missing company-type compensation reliability checks');
+  fail('batch prompt missing company-type compensation reliability checks or Apply output contract');
 }
+
 
 const pipelineMode = readFile('modes/pipeline.md');
 if (
@@ -6468,10 +6474,15 @@ try {
     'echo "You\\x27ve hit your session limit · resets 12:30pm (Asia/Taipei)"',
     'exit 1',
   ].join('\n') + '\n');
+  writeFileSync(join(fakeBin, 'agy'), [
+    '#!/usr/bin/env bash',
+    'echo "You\\x27ve hit your session limit · resets 12:30pm (Asia/Taipei)"',
+    'exit 1',
+  ].join('\n') + '\n');
   if (process.platform === 'win32') {
-    try { execFileSync(getBash(), ['-c', 'chmod +x bin/claude'], { cwd: tmp }); } catch {}
+    try { execFileSync(getBash(), ['-c', 'chmod +x bin/claude bin/agy'], { cwd: tmp }); } catch {}
   } else {
-    execFileSync('chmod', ['+x', join(fakeBin, 'claude')]);
+    execFileSync('chmod', ['+x', join(fakeBin, 'claude'), join(fakeBin, 'agy')]);
   }
 
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}` };
@@ -6499,8 +6510,8 @@ try {
     env,
     stdio: ['pipe', 'pipe', 'pipe'],
   }) || '';
-  if (dry.includes('#1: https://example.com/one') && !dry.includes('#2: https://example.com/two')) {
-    pass('--resume-paused dry-run selects paused jobs only');
+  if (dry.includes('#1: https://example.com/one') && dry.includes('#2: https://example.com/two')) {
+    pass('--resume-paused dry-run includes paused jobs and drains the remaining backlog');
   } else {
     fail(`--resume-paused selection wrong: ${dry}`);
   }
@@ -6580,7 +6591,7 @@ try {
   const { tmp, batchDir, fakeBin } = makeTierFixture('spend_tier: economy\n');
   const argFile = join(tmp, 'claude-argv.txt');
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}`, BATCH_ARG_FILE: argFile };
-  const out = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
+  const out = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--cli', 'claude', '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
   const argv = existsSync(argFile) ? readFileSync(argFile, 'utf-8') : '';
   if (argv.includes('--model') && argv.includes('claude-haiku-4-5') && out.includes('spend_tier=economy')) {
     pass('economy spend_tier resolves to claude-haiku-4-5');
@@ -6595,7 +6606,7 @@ try {
   const { tmp, batchDir, fakeBin } = makeTierFixture('spend_tier: premium\n');
   const argFile = join(tmp, 'claude-argv.txt');
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}`, BATCH_ARG_FILE: argFile };
-  const premiumOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
+  const premiumOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--cli', 'claude', '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
   const premiumArgv = existsSync(argFile) ? readFileSync(argFile, 'utf-8') : '';
   if (premiumArgv.includes('--model') && premiumArgv.includes('claude-opus-4-8') && premiumOut.includes('spend_tier=premium')) {
     pass('premium spend_tier resolves to claude-opus-4-8');
@@ -6610,7 +6621,7 @@ try {
   const { tmp, batchDir, fakeBin } = makeTierFixture('spend_tier: premium\n');
   const argFile = join(tmp, 'claude-argv.txt');
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}`, BATCH_ARG_FILE: argFile };
-  const overrideOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1', '--model', 'claude-sonnet-4-6'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
+  const overrideOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--cli', 'claude', '--parallel', '1', '--model', 'claude-sonnet-4-6'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
   const overrideArgv = existsSync(argFile) ? readFileSync(argFile, 'utf-8') : '';
   if (overrideArgv.includes('--model') && overrideArgv.includes('claude-sonnet-4-6') && !overrideArgv.includes('claude-opus-4-8') && overrideOut.includes('explicit --model override')) {
     pass('--model override takes precedence over spend_tier');
@@ -6625,7 +6636,7 @@ try {
   const { tmp, batchDir, fakeBin } = makeTierFixture('# no spend_tier key\nname: test\n');
   const argFile = join(tmp, 'claude-argv.txt');
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}`, BATCH_ARG_FILE: argFile };
-  const standardDefaultOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
+  const standardDefaultOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--cli', 'claude', '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
   const standardDefaultArgv = existsSync(argFile) ? readFileSync(argFile, 'utf-8') : '';
   if (standardDefaultArgv.includes('--model') && standardDefaultArgv.includes('claude-sonnet-4-6') && standardDefaultOut.includes('spend_tier=standard')) {
     pass('missing spend_tier key defaults to standard tier (claude-sonnet-4-6)');
@@ -6640,7 +6651,7 @@ try {
   const { tmp, batchDir, fakeBin } = makeTierFixture('spend_tier: turbo\n');
   const argFile = join(tmp, 'claude-argv.txt');
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}`, BATCH_ARG_FILE: argFile };
-  const invalidTierOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
+  const invalidTierOut = run(getBash(), [toBashPath(join(batchDir, 'batch-runner.sh')), '--cli', 'claude', '--parallel', '1'], { cwd: tmp, env, stdio: ['pipe', 'pipe', 'pipe'] }) || '';
   const invalidTierArgv = existsSync(argFile) ? readFileSync(argFile, 'utf-8') : '';
   if (invalidTierArgv.includes('--model') && invalidTierArgv.includes('claude-sonnet-4-6') && invalidTierOut.includes('spend_tier=standard')) {
     pass('invalid spend_tier value falls back to standard tier (claude-sonnet-4-6)');
@@ -6706,7 +6717,7 @@ try {
   // single browser when --parallel > 1 (issue #506).
   const claudeArgsLine = batchRunner
     .split('\n')
-    .find(l => l.includes('claude_args=('));
+    .find(l => l.includes('worker_args=(-p') && l.includes('--strict-mcp-config'));
   if (claudeArgsLine && claudeArgsLine.includes('--strict-mcp-config')) {
     pass('batch workers spawn with --strict-mcp-config (no inherited MCP)');
   } else {
