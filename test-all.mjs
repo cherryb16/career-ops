@@ -6468,10 +6468,15 @@ try {
     'echo "You\\x27ve hit your session limit · resets 12:30pm (Asia/Taipei)"',
     'exit 1',
   ].join('\n') + '\n');
+  writeFileSync(join(fakeBin, 'agy'), [
+    '#!/usr/bin/env bash',
+    'echo "You\\x27ve hit your session limit · resets 12:30pm (Asia/Taipei)"',
+    'exit 1',
+  ].join('\n') + '\n');
   if (process.platform === 'win32') {
-    try { execFileSync(getBash(), ['-c', 'chmod +x bin/claude'], { cwd: tmp }); } catch {}
+    try { execFileSync(getBash(), ['-c', 'chmod +x bin/claude bin/agy'], { cwd: tmp }); } catch {}
   } else {
-    execFileSync('chmod', ['+x', join(fakeBin, 'claude')]);
+    execFileSync('chmod', ['+x', join(fakeBin, 'claude'), join(fakeBin, 'agy')]);
   }
 
   const env = { ...process.env, PATH: `${fakeBin}${delimiter}${process.env.PATH}` };

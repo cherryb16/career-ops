@@ -31,6 +31,10 @@ All scripts live in the project root as `.mjs` modules and are exposed via `npm 
 | `npm run invite-match` | `invite-match.mjs` | Fuzzy-match a pasted interview-invite email against `data/applications.md` |
 | `npm run paste-reply` | `paste-reply.mjs` | Manual/no-Gmail input into the `reply-watch.mjs` classification pipeline |
 | `npm run openai:tailor` | `openai-tailor.mjs` | Tailor a CV via any OpenAI-compatible endpoint (headless companion to `openai-eval.mjs`) |
+| `npm run overnight` | `automation/overnight-workflow.mjs` | Resumable overnight scan and application evaluation workflow |
+| `npm run digest` | `automation/daily-digest.mjs` | 7:00 AM daily digest report |
+| `npm run weekly-review` | `automation/weekly-review.mjs` | Sunday 1:00 PM full pipeline review |
+| `npm run exception-report` | `automation/exception-report.mjs` | Immediate exception report (silent when clean) |
 
 ---
 

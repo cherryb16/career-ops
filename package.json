@@ -51,7 +51,11 @@
     "build:dashboard": "node build-dashboard.mjs",
     "serve:dashboard": "cd dashboard && go run . --path ..",
     "postinstall": "npx playwright install chromium --with-deps || npx playwright install chromium --with-deps",
-    "manifesto": "node manifesto.mjs"
+    "manifesto": "node manifesto.mjs",
+    "overnight": "node automation/overnight-workflow.mjs",
+    "digest": "node automation/daily-digest.mjs",
+    "weekly-review": "node automation/weekly-review.mjs",
+    "exception-report": "node automation/exception-report.mjs"
   },
   "keywords": [
     "ai",
