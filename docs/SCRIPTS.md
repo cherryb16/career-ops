@@ -31,6 +31,36 @@ All scripts live in the project root as `.mjs` modules and are exposed via `npm 
 | `npm run invite-match` | `invite-match.mjs` | Fuzzy-match a pasted interview-invite email against `data/applications.md` |
 | `npm run paste-reply` | `paste-reply.mjs` | Manual/no-Gmail input into the `reply-watch.mjs` classification pipeline |
 | `npm run openai:tailor` | `openai-tailor.mjs` | Tailor a CV via any OpenAI-compatible endpoint (headless companion to `openai-eval.mjs`) |
+| `npm run overnight` | `automation/overnight-workflow.mjs` | Resumable overnight scan and application evaluation workflow |
+| `npm run digest` | `automation/daily-digest.mjs` | 7:00 AM daily digest report |
+| `npm run weekly-review` | `automation/weekly-review.mjs` | Sunday 1:00 PM full pipeline review |
+| `npm run exception-report` | `automation/exception-report.mjs` | Immediate exception report (silent when clean) |
+| `npm run test:overnight` | `tests/overnight-workflow.test.mjs` | Focused overnight workflow safety/resume tests |
+
+---
+
+## Overnight automation
+
+`npm run overnight -- --json` runs the public-only scanner, applies the existing
+scripted filters/deduplication, and drains the batch queue with AGY at exactly
+two workers and no offer limit. Runtime checkpoints stay in ignored user state.
+Re-running an unchanged generation reuses hashed role/card keys and replaces the
+same generation checkpoint instead of duplicating cards or counts.
+
+Use `--dry-run` to preview without writing the lock, batch input, checkpoint, or
+review artifacts. Unattended scanning excludes LinkedIn, Handshake,
+authenticated plugins, and browser-login sources; those remain human blockers.
+The workflow only prepares review packages and never submits an application,
+sends a message, contacts a recruiter, or changes an application to Applied.
+
+Cron-facing read-only reports are `npm run digest -- --json` (daily),
+`npm run weekly-review -- --json` (seven-day review), and
+`npm run exception-report -- --json` (silent when there is no material alert).
+
+Command paths can be injected for isolated tests or installations with custom
+tool locations using `--scan-command`, `--runner-command`, `--prepare-command`,
+and `--liveness-command`; arguments remain fixed arrays and are never passed to
+a shell.
 
 ---
 

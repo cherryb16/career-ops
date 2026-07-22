@@ -1,33 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# career-ops batch runner — standalone orchestrator for claude -p workers
-# Reads batch-input.tsv, delegates each offer to a claude -p worker,
+# career-ops batch runner — standalone orchestrator for headless workers (default: agy)
+# Reads batch-input.tsv, delegates each offer to a worker CLI (agy, hermes, or claude),
 # tracks state in batch-state.tsv for resumability.
 #
-# NOTE: This script is Claude Code-specific. It uses claude -p with
-# --dangerously-skip-permissions and --append-system-prompt-file flags
-# that are not available in other CLIs. Multi-CLI support is out of scope
-# for now — contributions welcome.
+# NOTE: This script defaults to agy (Antigravity CLI) workers. Multi-CLI support
+# is available via the --cli flag (hermes, agy, or claude).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BATCH_DIR="$SCRIPT_DIR"
-INPUT_FILE="$BATCH_DIR/batch-input.tsv"
-STATE_FILE="$BATCH_DIR/batch-state.tsv"
-PROMPT_FILE="$BATCH_DIR/batch-prompt.md"
+BATCH_DIR="${CAREER_OPS_BATCH:-$SCRIPT_DIR}"
 PROFILE_FILE="$PROJECT_DIR/config/profile.yml"
-LOGS_DIR="$BATCH_DIR/logs"
-DISCARD_LOG="$LOGS_DIR/discard.log"
-TRACKER_DIR="$BATCH_DIR/tracker-additions"
 REPORTS_DIR="$PROJECT_DIR/reports"
 APPLICATIONS_FILE="$PROJECT_DIR/data/applications.md"
-LOCK_FILE="$BATCH_DIR/batch-runner.pid"
-PAUSE_FILE="$BATCH_DIR/batch-runner.paused"
-STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
-STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
 STATE_LOCK_TIMEOUT_SECONDS=30
 MAIN_PID="${BASHPID:-$$}"
+
+sync_batch_paths() {
+  INPUT_FILE="$BATCH_DIR/batch-input.tsv"
+  STATE_FILE="$BATCH_DIR/batch-state.tsv"
+  PROMPT_FILE="$BATCH_DIR/batch-prompt.md"
+  LOGS_DIR="$BATCH_DIR/logs"
+  DISCARD_LOG="$LOGS_DIR/discard.log"
+  TRACKER_DIR="$BATCH_DIR/tracker-additions"
+  LOCK_FILE="$BATCH_DIR/batch-runner.pid"
+  PAUSE_FILE="$BATCH_DIR/batch-runner.paused"
+  STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
+  STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
+}
+sync_batch_paths
+
 
 # Defaults
 PARALLEL=1
@@ -55,17 +58,18 @@ is_decimal_number() {
 
 usage() {
   cat <<'USAGE'
-career-ops batch runner — process job offers in batch via headless workers (default: hermes)
+career-ops batch runner — process job offers in batch via headless workers (default: agy)
 Uses spend_tier from config/profile.yml unless --model overrides it.
 
 Usage: batch-runner.sh [OPTIONS]
 
 Options:
   --cli NAME           Worker CLI: hermes, agy, or claude (default: agy)
+  --batch-dir PATH     Batch input, state, prompt, logs, and lock directory
   --parallel N         Number of parallel workers (default: 1)
   --dry-run            Show what would be processed, don't execute
   --retry-failed       Only retry offers marked as "failed" in state
-  --resume-paused      Resume offers paused by a session/rate limit
+  --resume-paused      Include paused offers while also draining normal backlog
   --start-from N       Start from offer ID N (skip earlier IDs)
   --limit N            Max number of offers to process in this run
   --max-retries N      Max retry attempts per offer (default: 2)
@@ -104,6 +108,11 @@ USAGE
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --batch-dir)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "ERROR: --batch-dir requires a path"; exit 1; }
+      BATCH_DIR="$2"
+      shift 2
+      ;;
     --parallel) PARALLEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --retry-failed) RETRY_FAILED=true; shift ;;
@@ -126,6 +135,9 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
+
+sync_batch_paths
+
 
 if ! [[ "$RATE_LIMIT_SLEEP" =~ ^[0-9]+$ ]]; then
   echo "ERROR: --rate-limit-sleep must be a non-negative integer (seconds)."
@@ -189,16 +201,16 @@ check_prerequisites() {
       fi
       ;;
     agy)
-      AGY_CLI="/Users/mac_studio/.local/bin/agy"
-      if [[ ! -x "$AGY_CLI" ]]; then
-        echo "ERROR: 'agy' CLI not found at $AGY_CLI"
+      AGY_BIN="${AGY_BIN:-$(command -v agy 2>/dev/null || true)}"
+      if [[ -z "$AGY_BIN" || ! -x "$AGY_BIN" ]]; then
+        echo "ERROR: 'agy' CLI not found in PATH (or AGY_BIN is not executable)"
         exit 1
       fi
       ;;
     claude)
-      CLAUDE_CLI="/Users/mac_studio/.local/bin/claude"
-      if [[ ! -x "$CLAUDE_CLI" ]]; then
-        echo "ERROR: 'claude' CLI not found at $CLAUDE_CLI"
+      CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+      if [[ -z "$CLAUDE_BIN" || ! -x "$CLAUDE_BIN" ]]; then
+        echo "ERROR: 'claude' CLI not found in PATH (or CLAUDE_BIN is not executable)"
         exit 1
       fi
       ;;
@@ -632,10 +644,10 @@ process_offer() {
         hermes "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
       agy)
-        /Users/mac_studio/.local/bin/agy "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        "$AGY_BIN" "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
       claude|*)
-        /Users/mac_studio/.local/bin/claude "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        "$CLAUDE_BIN" "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
     esac
 
@@ -957,11 +969,7 @@ main() {
     local status
     status=$(get_status "$id")
 
-    if [[ "$RESUME_PAUSED" == "true" ]]; then
-      if [[ "$status" != "paused_rate_limit" ]]; then
-        continue
-      fi
-    elif [[ "$RETRY_FAILED" == "true" ]]; then
+    if [[ "$RETRY_FAILED" == "true" ]]; then
       # Only process failed offers
       if [[ "$status" != "failed" ]]; then
         continue
@@ -978,8 +986,9 @@ main() {
       if [[ "$status" == "completed" || "$status" == "skipped" ]]; then
         continue
       fi
-      # Paused rate-limit offers resume explicitly with --resume-paused.
-      if [[ "$status" == "paused_rate_limit" ]]; then
+      # Paused rate-limit offers resume only when explicitly requested; the
+      # flag does not suppress new/failed backlog rows.
+      if [[ "$status" == "paused_rate_limit" && "$RESUME_PAUSED" != "true" ]]; then
         continue
       fi
       # Skip failed offers that hit retry limit (unless --retry-failed)

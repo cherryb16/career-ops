@@ -1579,6 +1579,25 @@ async function verifyOffers(offers, { headedFallback = false, throttleBaseMs = 0
 // without breaking the pipeline.
 const GUARD_CODES = new Set(['invalid_url', 'unsupported_protocol', 'blocked_host']);
 
+/** Positive boundary for unattended scans. Provider resolution supplies the
+ * public/script-supported allowlist; this helper removes sources that require
+ * a human-authenticated browser before resolution is attempted. */
+export function isPublicAutomationEntry(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  const sourceText = `${entry.name || ''} ${entry.provider || ''} ${entry.scan_method || ''} ${entry.careers_url || ''} ${entry.api || ''}`;
+  if (/(?:linkedin|handshake|authenticated|browser[-_ ]?login|sign[-_ ]?in)/i.test(sourceText)) return false;
+  for (const rawUrl of [entry.careers_url, entry.api]) {
+    if (typeof rawUrl !== 'string') continue;
+    try {
+      const host = new URL(rawUrl).hostname.toLowerCase();
+      if (host === 'linkedin.com' || host.endsWith('.linkedin.com')
+        || host === 'handshake.com' || host.endsWith('.handshake.com')
+        || host === 'joinhandshake.com' || host.endsWith('.joinhandshake.com')) return false;
+    } catch { /* provider validation reports malformed configured URLs */ }
+  }
+  return true;
+}
+
 // guardStatusFor maps a guard code to the canonical scan-history status string.
 function guardStatusFor(code) {
   if (code === 'blocked_host') return 'skipped_blocked_host';
@@ -1589,6 +1608,10 @@ function guardStatusFor(code) {
 async function main() {
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
+  // Scheduled automation may only use built-in public/script-supported
+  // providers. Authenticated plugins, LinkedIn, Handshake, and login-only
+  // sources stay explicit human handoffs.
+  const publicOnly = args.includes('--public-only');
   const verify = args.includes('--verify');
   // Opt-in: on an anti-bot challenge (e.g. pracuj.pl Cloudflare wall), retry the
   // URL in a headed browser. Off by default — headed Chromium needs a display, so
@@ -1633,7 +1656,7 @@ async function main() {
   // Opt-in: merge enabled keyed/auth-gated provider plugins. Returns immediately
   // (no discovery, no dotenv, no process.env mutation) when config/plugins.yml is
   // absent — so a plain scan with no plugins configured stays byte-identical.
-  await mergeProviderPlugins(providers, { root: path.dirname(PROVIDERS_DIR) });
+  if (!publicOnly) await mergeProviderPlugins(providers, { root: path.dirname(PROVIDERS_DIR) });
   if (providers.size === 0) {
     console.error('Error: no providers loaded from providers/');
     process.exit(1);
@@ -1696,6 +1719,13 @@ async function main() {
       if (typeof entry.name !== 'string' || !entry.name.trim()) {
         console.error(`⚠️  Skipping entry — missing or non-string 'name' field: ${JSON.stringify(entry)}`);
         continue;
+      }
+      if (publicOnly) {
+        if (!isPublicAutomationEntry(entry)) {
+          skippedCount++;
+          agentHandoff.push({ company: entry.name, method: 'human-authenticated-source', query: '' });
+          continue;
+        }
       }
       if (filterCompany && !entry.name.toLowerCase().includes(filterCompany)) continue;
 
