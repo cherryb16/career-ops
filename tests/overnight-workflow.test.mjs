@@ -1,531 +1,248 @@
-// tests/overnight-workflow.test.mjs — Comprehensive test suite for overnight workflow automation
-
-import { pass, fail, NODE, ROOT } from './helpers.mjs';
-import { join, relative } from 'path';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'fs';
-import { tmpdir } from 'os';
-import { execFileSync } from 'child_process';
-import {
-  getNextPhoenix1AM,
-  parseResetTimestamp,
-  parsePipelinePendingRoles,
-  convertPendingRolesToBatchInput,
-  isSupportedAtsUrl,
-  runOvernightWorkflow,
-} from '../automation/overnight-workflow.mjs';
+import { pass, fail, ROOT } from './helpers.mjs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { acquireLock, cardIdempotencyKey, classifySource, getNextPhoenix1AM, parsePipelinePendingRoles, parseResetTimestamp, roleIdempotencyKey, runOvernightWorkflow } from '../automation/overnight-workflow.mjs';
 import { generateDailyDigest } from '../automation/daily-digest.mjs';
 import { generateWeeklyReview } from '../automation/weekly-review.mjs';
 import { generateExceptionReport } from '../automation/exception-report.mjs';
+import { isPublicAutomationEntry } from '../scan.mjs';
 
-console.log('\nautomation/overnight-workflow.mjs — test suite');
+console.log('\novernight career workflow — focused safety and resumability tests');
+let failures = 0;
+function check(condition, name, detail = '') { if (condition) pass(name); else { failures++; fail(`${name}${detail ? `: ${detail}` : ''}`); } }
 
-function createFixtureWorkspace() {
-  const tmpParent = join(ROOT, 'tmp');
-  mkdirSync(tmpParent, { recursive: true });
-  const dir = mkdtempSync(join(tmpParent, 'cops-overnight-test-'));
-  const configDir = join(dir, 'config');
-  const dataDir = join(dir, 'data');
-  const batchDir = join(dir, 'batch');
-  const reportsDir = join(dir, 'reports');
-  const outputDir = join(dir, 'output');
-
-  mkdirSync(configDir, { recursive: true });
-  mkdirSync(dataDir, { recursive: true });
-  mkdirSync(batchDir, { recursive: true });
-  mkdirSync(reportsDir, { recursive: true });
-  mkdirSync(outputDir, { recursive: true });
-
-  const mockRunner = join(dir, 'mock-runner.sh');
-  writeFileSync(mockRunner, '#!/usr/bin/env bash\necho "mock runner done"\nexit 0\n');
-  execFileSync('chmod', ['+x', mockRunner]);
-
-  const mockScan = join(dir, 'mock-scan.mjs');
-  writeFileSync(mockScan, 'console.log("mock scan done");\n');
-
-  return {
-    dir,
-    configDir,
-    dataDir,
-    batchDir,
-    reportsDir,
-    outputDir,
-    mockRunner,
-    mockScan,
-    clean: () => rmSync(dir, { recursive: true, force: true }),
+function fixture() {
+  const root = mkdtempSync(path.join(ROOT, 'tmp', 'overnight-'));
+  const dirs = Object.fromEntries(['data', 'batch', 'reports', 'output'].map((name) => [name, path.join(root, name)]));
+  Object.values(dirs).forEach((dir) => mkdirSync(dir, { recursive: true }));
+  const noop = path.join(root, 'noop.mjs');
+  writeFileSync(noop, 'process.stdout.write("ok\\n");\n');
+  const active = path.join(root, 'active.mjs');
+  writeFileSync(active, 'process.stdout.write("✅ active https://redacted.invalid/job\\n");\n');
+  const prepare = path.join(root, 'prepare.mjs');
+  writeFileSync(prepare, 'process.stdout.write("safe prefill prepared\\n");\n');
+  const command = (script) => ({ file: process.execPath, args: [script] });
+  const base = {
+    rootDir: root, dataDir: dirs.data, batchDir: dirs.batch, reportsDir: dirs.reports, outputDir: dirs.output,
+    pipelineFile: path.join(dirs.data, 'pipeline.md'), stateFile: path.join(dirs.batch, 'batch-state.tsv'),
+    checkpointFile: path.join(dirs.data, '.overnight-checkpoint.json'),
+    scanCommand: command(noop), dedupCommand: command(noop), runnerCommand: command(noop),
+    reconcileCommand: command(noop), verifyCommand: command(noop), livenessCommand: command(active), prepareCommand: command(prepare),
+    json: false, now: new Date('2026-07-21T07:00:00Z'),
   };
+  return { root, ...dirs, base, command, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-try {
-  // Test 1: Empty scans
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const pipelineFile = join(ws.dataDir, 'pipeline.md');
-      writeFileSync(pipelineFile, '# Pipeline\n\n## Pendientes\n\n(No offers)\n');
-
-      const opts = {
-        dryRun: true,
-        json: true,
-        configDir: ws.configDir,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        reportsDir: ws.reportsDir,
-        outputDir: ws.outputDir,
-        pipelineFile,
-        stateFile: join(ws.batchDir, 'batch-state.tsv'),
-        runnerCmd: ws.mockRunner,
-        scanCmd: `node "${ws.mockScan}"`,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-      };
-
-      const res = await runOvernightWorkflow(opts);
-      if (res && res.discovered === 0 && res.eligible === 0) {
-        pass('1. Empty scans handled gracefully with zero discovered roles');
-      } else {
-        fail(`1. Empty scan output unexpected: ${JSON.stringify(res)}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 2: Duplicates handling
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const inputTsv = join(ws.batchDir, 'batch-input.tsv');
-      const pendingRoles = [
-        { title: 'Engineer', url: 'https://example.com/job1', source: 'test' },
-        { title: 'Engineer', url: 'https://example.com/job1', source: 'test' },
-        { title: 'Designer', url: 'https://example.com/job2', source: 'test' },
-      ];
-
-      const r1 = convertPendingRolesToBatchInput(inputTsv, pendingRoles);
-      const r2 = convertPendingRolesToBatchInput(inputTsv, pendingRoles);
-
-      const lines = readFileSync(inputTsv, 'utf-8').split(/\r?\n/).filter(Boolean);
-      if (r1.addedCount === 2 && r2.addedCount === 0 && lines.length === 3) {
-        pass('2. Duplicate pending roles deduplicated correctly in batch-input.tsv');
-      } else {
-        fail(`2. Duplicate roles handling failed: r1=${r1.addedCount}, r2=${r2.addedCount}, lines=${lines.length}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 3: Filtered / skipped roles
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const stateFile = join(ws.batchDir, 'batch-state.tsv');
-      writeFileSync(
-        stateFile,
-        'id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries\n' +
-        '1\thttps://example.com/job1\tskipped\t2026-07-21T00:00:00Z\t2026-07-21T00:01:00Z\t001\t2.0\tbelow-min-score\t0\n'
-      );
-
-      const opts = {
-        dryRun: true,
-        json: true,
-        configDir: ws.configDir,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        reportsDir: ws.reportsDir,
-        outputDir: ws.outputDir,
-        pipelineFile: join(ws.dataDir, 'pipeline.md'),
-        stateFile,
-        runnerCmd: ws.mockRunner,
-        scanCmd: `node "${ws.mockScan}"`,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-      };
-
-      const res = await runOvernightWorkflow(opts);
-      if (res && res.auto_filtered === 1) {
-        pass('3. Filtered/skipped roles correctly counted in auto_filtered metric');
-      } else {
-        fail(`3. Filtered roles count expected 1, got ${res ? res.auto_filtered : null}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 4: Full backlog drain
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const pipelineFile = join(ws.dataDir, 'pipeline.md');
-      writeFileSync(
-        pipelineFile,
-        '# Pipeline\n\n## Pendientes\n- [Acme - Senior Dev](https://boards.greenhouse.io/acme/jobs/101)\n- [Globex - Tech Lead](https://jobs.ashbyhq.com/globex/202)\n'
-      );
-
-      const stateFile = join(ws.batchDir, 'batch-state.tsv');
-      writeFileSync(
-        stateFile,
-        'id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries\n' +
-        '1\thttps://boards.greenhouse.io/acme/jobs/101\tcompleted\t2026-07-21T00:00:00Z\t2026-07-21T00:01:00Z\t001\t4.5\t-\t0\n' +
-        '2\thttps://jobs.ashbyhq.com/globex/202\tcompleted\t2026-07-21T00:00:00Z\t2026-07-21T00:01:00Z\t002\t4.0\t-\t0\n'
-      );
-
-      // Create reports and output files
-      writeFileSync(join(ws.reportsDir, '001-acme.md'), '# Report 001\nStatus: Passed\nScore: 4.5\n');
-      writeFileSync(join(ws.reportsDir, '002-globex.md'), '# Report 002\nStatus: Passed\nScore: 4.0\n');
-      writeFileSync(join(ws.outputDir, 'CV-001.pdf'), 'mock pdf');
-      writeFileSync(join(ws.outputDir, 'CV-002.pdf'), 'mock pdf');
-
-      const opts = {
-        dryRun: true,
-        json: true,
-        configDir: ws.configDir,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        reportsDir: ws.reportsDir,
-        outputDir: ws.outputDir,
-        pipelineFile,
-        stateFile,
-        runnerCmd: ws.mockRunner,
-        scanCmd: `node "${ws.mockScan}"`,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-      };
-
-      const res = await runOvernightWorkflow(opts);
-      if (res && res.discovered === 2 && res.evaluated === 2 && res.passed === 2) {
-        pass('4. Backlog drained fully with correct discovered, evaluated, and passed metrics');
-      } else {
-        fail(`4. Full backlog drain failed: ${JSON.stringify(res)}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 5: Stale lock recovery
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const lockFile = join(ws.batchDir, '.overnight-workflow.lock');
-      // Write a lock file with a non-existent PID (e.g. 999999)
-      writeFileSync(lockFile, JSON.stringify({ pid: 999999, started_at: '2026-01-01T00:00:00Z' }));
-
-      const opts = {
-        dryRun: true,
-        json: true,
-        configDir: ws.configDir,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        reportsDir: ws.reportsDir,
-        outputDir: ws.outputDir,
-        pipelineFile: join(ws.dataDir, 'pipeline.md'),
-        stateFile: join(ws.batchDir, 'batch-state.tsv'),
-        runnerCmd: ws.mockRunner,
-        scanCmd: `node "${ws.mockScan}"`,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-      };
-
-      const res = await runOvernightWorkflow(opts);
-      if (res && res.run_id) {
-        pass('5. Stale lock file safely detected and recovered');
-      } else {
-        fail('5. Stale lock recovery failed');
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 6: Interrupted / resumed batches
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const stateFile = join(ws.batchDir, 'batch-state.tsv');
-      writeFileSync(
-        stateFile,
-        'id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries\n' +
-        '1\thttps://example.com/job1\tpaused_rate_limit\t2026-07-21T00:00:00Z\t2026-07-21T00:01:00Z\t001\t-\tsession limit reached\t0\n'
-      );
-
-      const opts = {
-        dryRun: true,
-        json: true,
-        configDir: ws.configDir,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        reportsDir: ws.reportsDir,
-        outputDir: ws.outputDir,
-        pipelineFile: join(ws.dataDir, 'pipeline.md'),
-        stateFile,
-        runnerCmd: ws.mockRunner,
-        scanCmd: `node "${ws.mockScan}"`,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-      };
-
-      const res = await runOvernightWorkflow(opts);
-      if (res && res.paused === 1 && res.resume_at !== null) {
-        pass('6. Paused/interrupted batch detected with valid resume_at calculation');
-      } else {
-        fail(`6. Interrupted/resumed batch test failed: ${JSON.stringify(res)}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 7: Reliable reset timestamp parsing
-  {
-    const logText = 'Worker error: rate limit reached, resets 04:00am';
-    const parsed = parseResetTimestamp(logText);
-    if (parsed && typeof parsed === 'string' && parsed.endsWith('Z')) {
-      pass('7. Reliable reset timestamp parsed correctly (reset + 5 minutes)');
-    } else {
-      fail(`7. Reliable reset timestamp failed: ${parsed}`);
-    }
-  }
-
-  // Test 8: Missing reset timestamp fallback (next 1:00 AM America/Phoenix)
-  {
-    const phoenix1am = getNextPhoenix1AM();
-    if (phoenix1am && typeof phoenix1am === 'string' && phoenix1am.endsWith('Z')) {
-      pass('8. Missing reset timestamp falls back to next 1:00 AM America/Phoenix');
-    } else {
-      fail(`8. Phoenix 1am fallback failed: ${phoenix1am}`);
-    }
-  }
-
-  // Test 9: Idempotent reruns
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const pipelineFile = join(ws.dataDir, 'pipeline.md');
-      writeFileSync(pipelineFile, '# Pipeline\n\n## Pendientes\n- [Job](https://example.com/job1)\n');
-
-      const opts = {
-        dryRun: true,
-        json: true,
-        configDir: ws.configDir,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        reportsDir: ws.reportsDir,
-        outputDir: ws.outputDir,
-        pipelineFile,
-        stateFile: join(ws.batchDir, 'batch-state.tsv'),
-        runnerCmd: ws.mockRunner,
-        scanCmd: `node "${ws.mockScan}"`,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-      };
-
-      const res1 = await runOvernightWorkflow(opts);
-      const res2 = await runOvernightWorkflow(opts);
-
-      if (res1.idempotency_keys.length === 1 && res2.idempotency_keys.length === 1 && res1.idempotency_keys[0] === res2.idempotency_keys[0]) {
-        pass('9. Idempotent reruns produce consistent idempotency keys without state duplication');
-      } else {
-        fail(`9. Idempotent rerun failed: res1=${JSON.stringify(res1)}, res2=${JSON.stringify(res2)}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 10: Passed package creation & ATS prefill check
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const stateFile = join(ws.batchDir, 'batch-state.tsv');
-      writeFileSync(
-        stateFile,
-        'id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries\n' +
-        '101\thttps://boards.greenhouse.io/acme/jobs/999\tcompleted\t2026-07-21T00:00:00Z\t2026-07-21T00:01:00Z\t101\t4.8\t-\t0\n'
-      );
-
-      writeFileSync(join(ws.reportsDir, '101-acme-role.md'), '# Report 101\nStatus: Passed\nScore: 4.8\n');
-      writeFileSync(join(ws.outputDir, 'CV-101.pdf'), 'mock pdf payload');
-      writeFileSync(join(ws.outputDir, 'cover-101.txt'), 'mock cover letter');
-
-      const opts = {
-        dryRun: true,
-        json: true,
-        configDir: ws.configDir,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        reportsDir: ws.reportsDir,
-        outputDir: ws.outputDir,
-        pipelineFile: join(ws.dataDir, 'pipeline.md'),
-        stateFile,
-        runnerCmd: ws.mockRunner,
-        scanCmd: `node "${ws.mockScan}"`,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-      };
-
-      const res = await runOvernightWorkflow(opts);
-      const packageFile = join(ws.reportsDir, 'packages', 'package-101.json');
-
-      if (res && res.draft_ready === 1 && existsSync(packageFile)) {
-        const pkgData = JSON.parse(readFileSync(packageFile, 'utf-8'));
-        if (pkgData.status === 'Passed' && pkgData.pdf_file && isSupportedAtsUrl(pkgData.url)) {
-          pass('10. Passed role review package manifest created with PDF and ATS prefill support');
-        } else {
-          fail(`10. Package content invalid: ${JSON.stringify(pkgData)}`);
-        }
-      } else {
-        fail(`10. Package creation failed: res=${JSON.stringify(res)}, packageExists=${existsSync(packageFile)}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 11: Missing artifacts handling
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const stateFile = join(ws.batchDir, 'batch-state.tsv');
-      writeFileSync(
-        stateFile,
-        'id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries\n' +
-        '102\thttps://example.com/job102\tcompleted\t2026-07-21T00:00:00Z\t2026-07-21T00:01:00Z\t102\t4.0\t-\t0\n'
-      );
-      // Notice: report and PDF are intentionally NOT created
-
-      const opts = {
-        dryRun: true,
-        json: true,
-        configDir: ws.configDir,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        reportsDir: ws.reportsDir,
-        outputDir: ws.outputDir,
-        pipelineFile: join(ws.dataDir, 'pipeline.md'),
-        stateFile,
-        runnerCmd: ws.mockRunner,
-        scanCmd: `node "${ws.mockScan}"`,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-      };
-
-      const res = await runOvernightWorkflow(opts);
-      if (res && res.missing_artifact === 1) {
-        pass('11. Missing artifacts recorded without marking application submitted');
-      } else {
-        fail(`11. Missing artifacts test failed: ${JSON.stringify(res)}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 12: In-progress digest
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const lockFile = join(ws.batchDir, '.overnight-workflow.lock');
-      writeFileSync(lockFile, JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() }));
-
-      const digest = generateDailyDigest({
-        json: true,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        reportsDir: ws.reportsDir,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-        stateFile: join(ws.batchDir, 'batch-state.tsv'),
-      });
-
-      if (digest && digest.in_progress === true) {
-        pass('12. Daily digest correctly detects active lock file and reports in-progress status');
-      } else {
-        fail(`12. In-progress digest test failed: ${JSON.stringify(digest)}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 13: Weekly review
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const stateFile = join(ws.batchDir, 'batch-state.tsv');
-      writeFileSync(
-        stateFile,
-        'id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries\n' +
-        '1\thttps://example.com/job1\tcompleted\t2026-07-21T00:00:00Z\t2026-07-21T00:01:00Z\t001\t4.0\t-\t0\n' +
-        '2\thttps://example.com/job2\tcompleted\t2026-07-21T00:00:00Z\t2026-07-21T00:01:00Z\t002\t5.0\t-\t0\n'
-      );
-
-      const review = generateWeeklyReview({
-        json: true,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        reportsDir: ws.reportsDir,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-        stateFile,
-      });
-
-      if (review && review.summary.completed === 2 && review.summary.average_score === 4.5) {
-        pass('13. Weekly review aggregates completed metrics and average scores correctly');
-      } else {
-        fail(`13. Weekly review test failed: ${JSON.stringify(review)}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 14: Exception report (silent when empty)
-  {
-    const ws = createFixtureWorkspace();
-    try {
-      const rep = generateExceptionReport({
-        json: true,
-        dataDir: ws.dataDir,
-        batchDir: ws.batchDir,
-        checkpointFile: join(ws.dataDir, '.overnight-checkpoint.json'),
-      });
-
-      if (rep === null) {
-        pass('14. Exception report is completely silent (null) when no exceptions exist');
-      } else {
-        fail(`14. Exception report non-null on clean state: ${JSON.stringify(rep)}`);
-      }
-    } finally {
-      ws.clean();
-    }
-  }
-
-  // Test 15: Static Safety Invariant Assertions
-  {
-    const workflowCode = readFileSync(join(ROOT, 'automation', 'overnight-workflow.mjs'), 'utf-8');
-    const digestCode = readFileSync(join(ROOT, 'automation', 'daily-digest.mjs'), 'utf-8');
-    const weeklyCode = readFileSync(join(ROOT, 'automation', 'weekly-review.mjs'), 'utf-8');
-    const exceptionCode = readFileSync(join(ROOT, 'automation', 'exception-report.mjs'), 'utf-8');
-
-    const forbiddenPatterns = [
-      /\bfetch\s*\([^)]*method:\s*['"]POST['"]/i,
-      /\bhttp\.request\s*\([^)]*method:\s*['"]POST['"]/i,
-      /\baxios\.post\b/i,
-      /\bsendEmail\b/i,
-      /\brecruiterOutreach\b/i,
-      /status\s*=\s*['"]applied['"]/i,
-      /status\s*=\s*['"]submitted['"]/i,
-    ];
-
-    let violation = null;
-    for (const code of [workflowCode, digestCode, weeklyCode, exceptionCode]) {
-      for (const pat of forbiddenPatterns) {
-        if (pat.test(code)) {
-          violation = pat.toString();
-          break;
-        }
-      }
-    }
-
-    if (!violation) {
-      pass('15. Static safety assertions verified: No POST application calls, emails, or status mutations in workflow');
-    } else {
-      fail(`15. Static safety violation found: ${violation}`);
-    }
-  }
-
-} catch (err) {
-  fail(`overnight-workflow.test.mjs crashed: ${err.message}\n${err.stack}`);
+function pipeline(...rows) { return `# Pipeline\n\n## Pending\n\n${rows.join('\n')}\n\n## Processed\n\n- [x] old\n`; }
+function state(rows) { return `id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries\n${rows.join('\n')}${rows.length ? '\n' : ''}`; }
+function report({ decision = 'Apply', pdf = null, cover = true, answers = true, deadline = null } = {}) {
+  return `# Report\n\n**PDF:** ${pdf || 'not generated'}\n\n## Machine Summary\n\n\`\`\`yaml\nfinal_decision: "${decision}"\n\`\`\`\n${cover ? '\n## Cover Letter Draft\n\nSpecific draft.\n' : ''}${answers ? '\n## H) Draft Application Answers\n\nSpecific answers.\n' : ''}${deadline ? `\nDeadline: ${deadline}\n` : ''}`;
 }
+
+// Real pipeline grammar and reliable section termination.
+{
+  const roles = parsePipelinePendingRoles(pipeline(
+    '- [ ] https://boards.greenhouse.io/acme/jobs/1 | Acme | Engineer',
+    '- [ ] [Designer](https://jobs.ashbyhq.com/acme/2)',
+  ));
+  check(roles.length === 2 && roles[0].company === 'Acme' && !roles.some((r) => r.url === 'old'), 'pipeline parser handles canonical rows and stops at next section');
+}
+
+// Empty scan and dry-run immutability (no input/checkpoint/lock/package writes).
+{
+  const ws = fixture();
+  try {
+    writeFileSync(ws.base.pipelineFile, pipeline());
+    const before = readdirSync(ws.root, { recursive: true }).sort().join('\n');
+    const result = await runOvernightWorkflow({ ...ws.base, dryRun: true });
+    const after = readdirSync(ws.root, { recursive: true }).sort().join('\n');
+    check(result.discovered === 0 && result.eligible === 0, 'empty scans produce zero scoped counts');
+    check(before === after && !existsSync(ws.base.checkpointFile) && !existsSync(path.join(ws.batch, '.overnight-workflow.lock')), 'dry-run leaves persistent state and artifacts unchanged');
+  } finally { ws.cleanup(); }
+}
+
+// Public-only allowlist boundary and authenticated blockers.
+{
+  check(classifySource({ url: 'https://boards.greenhouse.io/acme/jobs/1', source: 'pipeline' }).eligible, 'public script-supported ATS is eligible');
+  check(!classifySource({ url: 'https://www.linkedin.com/jobs/view/1', source: 'pipeline' }).eligible
+    && !classifySource({ url: 'https://app.joinhandshake.com/jobs/1', source: 'pipeline' }).eligible
+    && !classifySource({ url: 'https://example.com/login/job/1', source: 'pipeline' }).eligible, 'LinkedIn, Handshake, and login-only sources are excluded');
+  check(isPublicAutomationEntry({ name: 'Greenhouse', provider: 'greenhouse', careers_url: 'https://boards.greenhouse.io/acme' })
+    && !isPublicAutomationEntry({ name: 'LinkedIn', careers_url: 'https://linkedin.com/jobs' })
+    && !isPublicAutomationEntry({ name: 'Handshake', careers_url: 'https://app.joinhandshake.com/jobs' }), 'scanner public-only boundary directly excludes authenticated sources');
+}
+
+// Atomic active lock rejection and stale lock recovery.
+{
+  const ws = fixture();
+  try {
+    const lock = path.join(ws.batch, '.overnight-workflow.lock');
+    const release = acquireLock(lock, ws.base.now);
+    let rejected = false;
+    try { acquireLock(lock, ws.base.now); } catch { rejected = true; }
+    check(rejected, 'atomic lock rejects a second active owner');
+    release();
+    writeFileSync(lock, JSON.stringify({ pid: 99999999, token: 'stale' }));
+    const releaseRecovered = acquireLock(lock, ws.base.now);
+    check(existsSync(lock), 'stale lock is recovered atomically');
+    releaseRecovered();
+  } finally { ws.cleanup(); }
+}
+
+// A missing tailored PDF is generated only from the same report's HTML by the
+// repository PDF generator command, using argument arrays.
+{
+  const ws = fixture();
+  try {
+    const url = 'https://jobs.lever.co/acme/pdf-role';
+    writeFileSync(ws.base.pipelineFile, pipeline(`- [ ] ${url} | Acme | PDF Role`));
+    writeFileSync(ws.base.stateFile, state([`1\t${url}\tcompleted\t-\t-\t045\t4.8\t-\t0`]));
+    writeFileSync(path.join(ws.output, 'cv-acme-045.html'), '<html>fixture</html>');
+    writeFileSync(path.join(ws.reports, '045-acme.md'), report({ pdf: 'output/cv-acme-045.pdf' }));
+    const pdfGenerator = path.join(ws.root, 'pdf-generator.mjs');
+    writeFileSync(pdfGenerator, `import { writeFileSync } from 'node:fs'; writeFileSync(process.argv[3], 'generated pdf'); writeFileSync(new URL('./pdf-args.json', import.meta.url), JSON.stringify(process.argv.slice(2)));`);
+    const result = await runOvernightWorkflow({ ...ws.base, pdfCommand: ws.command(pdfGenerator) });
+    const args = JSON.parse(readFileSync(path.join(ws.root, 'pdf-args.json'), 'utf8'));
+    check(result.draft_ready === 1 && args[0].endsWith('cv-acme-045.html') && args[1].endsWith('cv-acme-045.pdf') && args[2] === '--report=45', 'existing PDF generator is invoked with role-bound argument-array paths');
+  } finally { ws.cleanup(); }
+}
+
+// Exact timezone-aware reset semantics and Phoenix fallback.
+{
+  const now = new Date('2026-07-21T00:00:00Z');
+  check(parseResetTimestamp('session limit; resets 12:30pm (Asia/Taipei)', now) === '2026-07-21T04:35:00.000Z', 'timezone reset is exact reset plus five minutes');
+  check(parseResetTimestamp('reset at 2026-07-21T11:10:00-04:00', now) === '2026-07-21T15:15:00.000Z', 'offset timestamp is exact reset plus five minutes');
+  check(parseResetTimestamp('rate limited without a time', now) === null && getNextPhoenix1AM(now) === '2026-07-21T08:00:00.000Z', 'missing reset falls back to next 1:00 AM America/Phoenix');
+}
+
+// Duplicates, filtered sources, exact runner args, full normal+paused backlog drain.
+{
+  const ws = fixture();
+  try {
+    const runner = path.join(ws.root, 'runner.mjs');
+    writeFileSync(runner, `
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+const root = path.dirname(new URL(import.meta.url).pathname);
+writeFileSync(path.join(root, 'runner-args.json'), JSON.stringify(process.argv.slice(2)));
+const input = readFileSync(path.join(root, 'batch/batch-input.tsv'), 'utf8').trim().split('\\n').slice(1);
+const rows = input.map((line, i) => { const [id,url] = line.split('\\t'); return [id,url,'completed','2026-07-21T07:00:00Z','2026-07-21T07:01:00Z',String(i+1).padStart(3,'0'),'4.5','-','0'].join('\\t'); });
+writeFileSync(path.join(root, 'batch/batch-state.tsv'), 'id\\turl\\tstatus\\tstarted_at\\tcompleted_at\\treport_num\\tscore\\terror\\tretries\\n' + rows.join('\\n') + '\\n');
+`);
+    writeFileSync(ws.base.pipelineFile, pipeline(
+      '- [ ] https://boards.greenhouse.io/acme/jobs/1 | Acme | Engineer',
+      '- [ ] https://boards.greenhouse.io/acme/jobs/1 | Acme | Engineer',
+      '- [ ] https://www.linkedin.com/jobs/view/9 | LinkedIn | Blocked',
+      '- [ ] https://jobs.ashbyhq.com/acme/2 | Acme | Lead',
+    ));
+    writeFileSync(ws.base.stateFile, state(['1\thttps://boards.greenhouse.io/acme/jobs/1\tpaused_rate_limit\t-\t-\t001\t-\tlimit\t0']));
+    const result = await runOvernightWorkflow({ ...ws.base, runnerCommand: ws.command(runner) });
+    const args = JSON.parse(readFileSync(path.join(ws.root, 'runner-args.json'), 'utf8'));
+    const inputRows = readFileSync(path.join(ws.batch, 'batch-input.tsv'), 'utf8').trim().split('\n').slice(1);
+    check(JSON.stringify(args) === JSON.stringify(['--cli','agy','--parallel','2','--limit','0','--rate-limit-sleep','0','--resume-paused']), 'runner receives exact AGY parallelism-2 unbounded drain arguments');
+    check(inputRows.length === 2 && result.evaluated === 2 && result.authenticated_blockers === 1, 'duplicates are idempotent, authenticated roles filter, and full backlog drains');
+  } finally { ws.cleanup(); }
+}
+
+// Only Machine Summary Apply is Passed; complete package is role-bound and ready.
+{
+  const ws = fixture();
+  try {
+    const url = 'https://boards.greenhouse.io/acme/jobs/44';
+    writeFileSync(ws.base.pipelineFile, pipeline(`- [ ] ${url} | Acme | Engineer`));
+    writeFileSync(ws.base.stateFile, state([`1\t${url}\tcompleted\t-\t-\t044\t4.8\t-\t0`]));
+    const pdf = path.join(ws.output, 'cv-acme-044.pdf'); writeFileSync(pdf, 'pdf');
+    writeFileSync(path.join(ws.reports, '044-acme.md'), report({ pdf: 'output/cv-acme-044.pdf', deadline: '2026-07-22T06:00:00Z' }));
+    const result = await runOvernightWorkflow(ws.base);
+    const card = cardIdempotencyKey(url);
+    const manifest = JSON.parse(readFileSync(path.join(ws.reports, 'packages', `${card}.json`), 'utf8'));
+    check(result.passed === 1 && result.draft_ready === 1 && result.urgent_deadline === 1, 'proven Apply role creates a complete draft-ready package and urgent deadline count');
+    check(manifest.role_key === roleIdempotencyKey(url) && manifest.artifacts.tailored_pdf === 'output/cv-acme-044.pdf'
+      && manifest.artifacts.cover_letter && manifest.artifacts.application_answers && manifest.artifacts.ats_prefill
+      && manifest.liveness === 'active' && manifest.missing.length === 0 && manifest.errors.length === 0, 'package binds all required artifacts to the same role');
+  } finally { ws.cleanup(); }
+}
+
+// Completed is not Passed; Apply with missing artifacts is precise and never ready.
+{
+  const ws = fixture();
+  try {
+    const consider = 'https://jobs.ashbyhq.com/acme/consider';
+    const missing = 'https://jobs.ashbyhq.com/acme/missing';
+    writeFileSync(ws.base.pipelineFile, pipeline(`- [ ] ${consider} | Acme | Consider`, `- [ ] ${missing} | Acme | Missing`));
+    writeFileSync(ws.base.stateFile, state([
+      `1\t${consider}\tcompleted\t-\t-\t051\t4.9\t-\t0`, `2\t${missing}\tcompleted\t-\t-\t052\t4.9\t-\t0`,
+    ]));
+    writeFileSync(path.join(ws.reports, '051-consider.md'), report({ decision: 'Consider' }));
+    writeFileSync(path.join(ws.reports, '052-missing.md'), report({ decision: 'Apply', cover: false, answers: false }));
+    const result = await runOvernightWorkflow(ws.base);
+    const packageFiles = readdirSync(path.join(ws.reports, 'packages'));
+    const manifest = JSON.parse(readFileSync(path.join(ws.reports, 'packages', packageFiles[0]), 'utf8'));
+    check(result.passed === 1 && packageFiles.length === 1 && result.draft_ready === 0 && result.missing_artifact === 1, 'completed Consider is never packaged while incomplete Apply is not draft-ready');
+    check(manifest.missing.includes('tailored_pdf') && manifest.missing.includes('cover_letter') && manifest.missing.includes('application_answers')
+      && manifest.errors.some((e) => e.artifact === 'ats_prefill'), 'missing package records precise artifact and preparation errors');
+  } finally { ws.cleanup(); }
+}
+
+// Interrupted run uses only new relevant logs; exact resume and stable rerun generation.
+{
+  const ws = fixture();
+  try {
+    const url = 'https://jobs.ashbyhq.com/acme/paused';
+    writeFileSync(ws.base.pipelineFile, pipeline(`- [ ] ${url} | Acme | Paused`));
+    writeFileSync(ws.base.stateFile, state([`1\t${url}\tpaused_rate_limit\t-\t-\t061\t-\tlimit\t0`]));
+    mkdirSync(path.join(ws.batch, 'logs'), { recursive: true });
+    const old = path.join(ws.batch, 'logs', '061-1-old.log'); writeFileSync(old, 'resets 11:00pm (America/Phoenix)');
+    utimesSync(old, new Date('2026-07-20T00:00:00Z'), new Date('2026-07-20T00:00:00Z'));
+    const first = await runOvernightWorkflow(ws.base);
+    const second = await runOvernightWorkflow(ws.base);
+    const persisted = JSON.parse(readFileSync(ws.base.checkpointFile, 'utf8'));
+    check(first.resume_at === '2026-07-21T08:00:00.000Z' && second.generation_id === first.generation_id, 'paused run ignores stale logs and uses deterministic resume fallback');
+    check(persisted.runs.length === 1 && persisted.current.generation_id === first.generation_id, 'true rerun replaces one generation checkpoint without duplicate counts or cards');
+  } finally { ws.cleanup(); }
+}
+
+// PID-aware digest, seven-day-scoped weekly report, and manifest completeness.
+{
+  const ws = fixture();
+  try {
+    const now = new Date('2026-07-21T20:00:00Z');
+    writeFileSync(ws.base.checkpointFile, JSON.stringify({ schema_version: 2, current: { generation_id: 'new', evaluated: 2, passed: 1, draft_ready: 1 }, runs: [
+      { generation_id: 'old', completed_at: '2026-07-10T00:00:00Z', evaluated: 99, passed: 99 },
+      { generation_id: 'new', completed_at: '2026-07-20T00:00:00Z', evaluated: 2, passed: 1 },
+    ] }));
+    const lock = path.join(ws.batch, '.overnight-workflow.lock'); writeFileSync(lock, JSON.stringify({ pid: 99999999 }));
+    check(generateDailyDigest({ ...ws.base, json: false }).in_progress === false, 'daily digest ignores stale lock PID');
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, started_at: now.toISOString() }));
+    check(generateDailyDigest({ ...ws.base, json: false }).in_progress === true, 'daily digest includes a live in-progress checkpoint');
+    const packages = path.join(ws.reports, 'packages'); mkdirSync(packages, { recursive: true });
+    writeFileSync(path.join(packages, 'complete.json'), JSON.stringify({ generation_id: 'new', status: 'Passed', draft_ready: true, liveness: 'active', artifacts: { report: 'r', tailored_pdf: 'p', cover_letter: 'c', application_answers: 'a', ats_prefill: 'f' }, missing: [], errors: [] }));
+    writeFileSync(path.join(packages, 'false-ready.json'), JSON.stringify({ generation_id: 'new', status: 'Passed', draft_ready: true, liveness: 'active', artifacts: {}, missing: [], errors: [] }));
+    writeFileSync(path.join(packages, 'old-complete.json'), JSON.stringify({ generation_id: 'old', status: 'Passed', draft_ready: true, liveness: 'active', artifacts: { report: 'r', tailored_pdf: 'p', cover_letter: 'c', application_answers: 'a', ats_prefill: 'f' }, missing: [], errors: [] }));
+    const weekly = generateWeeklyReview({ ...ws.base, now, json: false });
+    check(weekly.summary.evaluated === 2 && weekly.summary.draft_packages_ready === 1 && weekly.generations === 1, 'weekly review scopes seven days and counts only complete manifests');
+  } finally { ws.cleanup(); }
+}
+
+// Exception output is silent when clean and bounded/PII-safe when material.
+{
+  const ws = fixture();
+  try {
+    check(generateExceptionReport({ ...ws.base, json: false }) === null, 'exception report is silent when non-material');
+    writeFileSync(ws.base.checkpointFile, JSON.stringify({ current: { generation_id: 'g', urgent_deadline: 1, errors: ['scan failure https://secret.example/jobs/1 person@example.com'] } }));
+    const exception = generateExceptionReport({ ...ws.base, json: false });
+    check(JSON.stringify(exception).includes('[url]') && JSON.stringify(exception).includes('[email]') && !JSON.stringify(exception).includes('secret.example'), 'exception report is bounded and PII-safe');
+  } finally { ws.cleanup(); }
+}
+
+// Static safety: array child processes only; no submission/contact/status mutation paths.
+{
+  const files = ['automation/overnight-workflow.mjs', 'automation/daily-digest.mjs', 'automation/weekly-review.mjs', 'automation/exception-report.mjs'];
+  const source = files.map((file) => readFileSync(path.join(ROOT, file), 'utf8')).join('\n');
+  check(!/exec(?:Sync|FileSync)?\s*\(/.test(source) && /shell:\s*false/.test(source), 'role-controlled child process execution is argument-array and shell-free');
+  check(!/(?:set-status\.mjs|contacto|sendEmail|axios\.post|method:\s*['"]POST['"]|status\s*[=:]\s*['"](?:Applied|Submitted)['"])/i.test(source), 'workflow has no submission, applied-state, email, or recruiter-contact invocation path');
+  const runner = readFileSync(path.join(ROOT, 'batch/batch-runner.sh'), 'utf8');
+  check(!/\/Users\/[A-Za-z0-9._-]+\//.test(runner) && runner.includes('CLI="agy"'), 'tracked runner has AGY default and no user-specific executable path');
+}
+
+if (failures) process.exitCode = 1;

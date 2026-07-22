@@ -1,624 +1,542 @@
 #!/usr/bin/env node
 
 /**
- * automation/overnight-workflow.mjs
+ * Deterministic, resumable overnight scan/evaluation coordinator.
  *
- * Deterministic overnight workflow orchestrator for career-ops.
- * Scans public portals, applies hard filters, evaluates pending roles via AGY batch-runner,
- * prepares review package manifests for Passed roles, and emits structured run summaries.
- *
- * Safety Invariant: NEVER submits applications, POSTs forms, sends emails/messages,
- * or invokes recruiter outreach. Authenticated portal sources remain explicit human blockers.
+ * This file deliberately has no submission or communication capability. It
+ * prepares drafts for human review and stops there.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'fs';
-import path from 'path';
-import { execSync, execFileSync, spawnSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import {
+  closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync,
+  renameSync, statSync, unlinkSync, writeFileSync,
+} from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(SCRIPT_DIR, '..');
+const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const SUMMARY_KEY_LIMIT = 100;
+const ERROR_LIMIT = 20;
+const ERROR_LENGTH = 180;
+const TERMINAL = new Set(['completed', 'skipped']);
+const BLOCKED_HOST_SUFFIXES = ['linkedin.com', 'handshake.com', 'joinhandshake.com'];
+const BLOCKED_SOURCE_RE = /(?:linkedin|handshake|browser[-_ ]?login|authenticated|sign[-_ ]?in)/i;
 
-// ── CLI Arg Parsing ──────────────────────────────────────────────────
-
-function parseArgs() {
-  const args = process.argv.slice(2);
-  const opts = {
-    dryRun: false,
-    json: false,
-    configDir: process.env.CAREER_OPS_CONFIG || path.join(ROOT_DIR, 'config'),
-    dataDir: process.env.CAREER_OPS_DATA || path.join(ROOT_DIR, 'data'),
-    batchDir: process.env.CAREER_OPS_BATCH || path.join(ROOT_DIR, 'batch'),
-    reportsDir: process.env.CAREER_OPS_REPORTS || path.join(ROOT_DIR, 'reports'),
-    outputDir: process.env.CAREER_OPS_OUTPUT || path.join(ROOT_DIR, 'output'),
-    portalsFile: process.env.CAREER_OPS_PORTALS || path.join(ROOT_DIR, 'portals.yml'),
-    stateFile: process.env.CAREER_OPS_STATE || null,
-    pipelineFile: process.env.CAREER_OPS_PIPELINE || null,
-    runnerCmd: process.env.CAREER_OPS_RUNNER_CMD || null,
-    prepareCmd: process.env.CAREER_OPS_PREPARE_CMD || null,
-    livenessCmd: process.env.CAREER_OPS_LIVENESS_CMD || null,
-    scanCmd: process.env.CAREER_OPS_SCAN_CMD || null,
-    checkpointFile: process.env.CAREER_OPS_CHECKPOINT || null,
-  };
-
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--dry-run') opts.dryRun = true;
-    else if (arg === '--json') opts.json = true;
-    else if (arg === '--config-dir' && i + 1 < args.length) opts.configDir = args[++i];
-    else if (arg === '--data-dir' && i + 1 < args.length) opts.dataDir = args[++i];
-    else if (arg === '--batch-dir' && i + 1 < args.length) opts.batchDir = args[++i];
-    else if (arg === '--reports-dir' && i + 1 < args.length) opts.reportsDir = args[++i];
-    else if (arg === '--output-dir' && i + 1 < args.length) opts.outputDir = args[++i];
-    else if (arg === '--portals-file' && i + 1 < args.length) opts.portalsFile = args[++i];
-    else if (arg === '--state-file' && i + 1 < args.length) opts.stateFile = args[++i];
-    else if (arg === '--pipeline-file' && i + 1 < args.length) opts.pipelineFile = args[++i];
-    else if (arg === '--runner-cmd' && i + 1 < args.length) opts.runnerCmd = args[++i];
-    else if (arg === '--prepare-cmd' && i + 1 < args.length) opts.prepareCmd = args[++i];
-    else if (arg === '--liveness-cmd' && i + 1 < args.length) opts.livenessCmd = args[++i];
-    else if (arg === '--scan-cmd' && i + 1 < args.length) opts.scanCmd = args[++i];
-    else if (arg === '--checkpoint-file' && i + 1 < args.length) opts.checkpointFile = args[++i];
-  }
-
-  if (!opts.stateFile) opts.stateFile = path.join(opts.batchDir, 'batch-state.tsv');
-  if (!opts.pipelineFile) opts.pipelineFile = path.join(opts.dataDir, 'pipeline.md');
-  if (!opts.checkpointFile) opts.checkpointFile = path.join(opts.dataDir, '.overnight-checkpoint.json');
-
-  return opts;
+function hash(value, length = 24) {
+  return createHash('sha256').update(String(value)).digest('hex').slice(0, length);
 }
 
-// ── Lock Management ──────────────────────────────────────────────────
+function atomicWrite(file, content) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, content, { encoding: 'utf8', mode: 0o600 });
+  renameSync(tmp, file);
+}
 
-function acquireLock(batchDir) {
-  const lockFile = path.join(batchDir, '.overnight-workflow.lock');
-  mkdirSync(batchDir, { recursive: true });
+function safeError(value) {
+  return String(value ?? 'unknown error')
+    .replace(/https?:\/\/\S+/gi, '[url]')
+    .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, '[email]')
+    .replace(/(?:\/Users|\/home)\/[^\s:]+/g, '[path]')
+    .replace(/\s+/g, ' ')
+    .slice(0, ERROR_LENGTH);
+}
 
-  if (existsSync(lockFile)) {
+function addError(errors, message) {
+  if (errors.length < ERROR_LIMIT) errors.push(safeError(message));
+}
+
+function normalizeCommand(value, fallbackFile, fallbackArgs = []) {
+  if (value && typeof value === 'object' && typeof value.file === 'string') {
+    return { file: value.file, args: Array.isArray(value.args) ? value.args.map(String) : [] };
+  }
+  if (typeof value === 'string' && value) return { file: value, args: [] };
+  return { file: fallbackFile, args: fallbackArgs };
+}
+
+function runCommand(command, extraArgs = [], { cwd = ROOT_DIR, env, maxBuffer = 512 * 1024 } = {}) {
+  const result = spawnSync(command.file, [...command.args, ...extraArgs], {
+    cwd, env: env || process.env, encoding: 'utf8', shell: false, maxBuffer,
+  });
+  return {
+    status: result.status ?? (result.error ? 1 : 0),
+    stdout: String(result.stdout || ''),
+    stderr: String(result.stderr || ''),
+    error: result.error || null,
+  };
+}
+
+function normalizeOptions(input = {}) {
+  const batchDir = input.batchDir || process.env.CAREER_OPS_BATCH || path.join(ROOT_DIR, 'batch');
+  const dataDir = input.dataDir || process.env.CAREER_OPS_DATA || path.join(ROOT_DIR, 'data');
+  const reportsDir = input.reportsDir || process.env.CAREER_OPS_REPORTS || path.join(ROOT_DIR, 'reports');
+  const outputDir = input.outputDir || process.env.CAREER_OPS_OUTPUT || path.join(ROOT_DIR, 'output');
+  const rootDir = input.rootDir || ROOT_DIR;
+  return {
+    dryRun: Boolean(input.dryRun), json: Boolean(input.json), now: input.now || new Date(),
+    rootDir, batchDir, dataDir, reportsDir, outputDir,
+    pipelineFile: input.pipelineFile || process.env.CAREER_OPS_PIPELINE || path.join(dataDir, 'pipeline.md'),
+    stateFile: input.stateFile || process.env.CAREER_OPS_STATE || path.join(batchDir, 'batch-state.tsv'),
+    inputFile: input.inputFile || path.join(batchDir, 'batch-input.tsv'),
+    checkpointFile: input.checkpointFile || process.env.CAREER_OPS_CHECKPOINT || path.join(dataDir, '.overnight-checkpoint.json'),
+    lockFile: input.lockFile || path.join(batchDir, '.overnight-workflow.lock'),
+    scanCommand: normalizeCommand(input.scanCommand || input.scanCmd || process.env.CAREER_OPS_SCAN_COMMAND, process.execPath, [path.join(ROOT_DIR, 'scan.mjs')]),
+    dedupCommand: normalizeCommand(input.dedupCommand, process.execPath, [path.join(ROOT_DIR, 'dedup-tracker.mjs')]),
+    runnerCommand: normalizeCommand(input.runnerCommand || input.runnerCmd || process.env.CAREER_OPS_RUNNER_COMMAND, path.join(ROOT_DIR, 'batch', 'batch-runner.sh')),
+    reconcileCommand: normalizeCommand(input.reconcileCommand, process.execPath, [path.join(ROOT_DIR, 'reconcile-pipeline.mjs')]),
+    verifyCommand: normalizeCommand(input.verifyCommand, process.execPath, [path.join(ROOT_DIR, 'verify-pipeline.mjs')]),
+    livenessCommand: normalizeCommand(input.livenessCommand || input.livenessCmd || process.env.CAREER_OPS_LIVENESS_COMMAND, process.execPath, [path.join(ROOT_DIR, 'check-liveness.mjs')]),
+    prepareCommand: normalizeCommand(input.prepareCommand || input.prepareCmd || process.env.CAREER_OPS_PREPARE_COMMAND, process.execPath, [path.join(ROOT_DIR, 'prepare-application.mjs')]),
+    pdfCommand: normalizeCommand(input.pdfCommand, process.execPath, [path.join(ROOT_DIR, 'generate-pdf.mjs')]),
+  };
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (err) { return err?.code === 'EPERM'; }
+}
+
+export function readActiveLock(lockFile) {
+  if (!existsSync(lockFile)) return null;
+  try {
+    const lock = JSON.parse(readFileSync(lockFile, 'utf8'));
+    return pidAlive(Number(lock.pid)) ? lock : null;
+  } catch { return null; }
+}
+
+export function acquireLock(lockFile, now = new Date()) {
+  mkdirSync(path.dirname(lockFile), { recursive: true });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const token = randomUUID();
     try {
-      const lockData = JSON.parse(readFileSync(lockFile, 'utf-8'));
-      const pid = lockData.pid;
-      let isAlive = false;
-      if (pid) {
+      const fd = openSync(lockFile, 'wx', 0o600);
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, token, started_at: now.toISOString() }));
+      closeSync(fd);
+      return () => {
         try {
-          process.kill(pid, 0);
-          isAlive = true;
-        } catch {
-          isAlive = false;
-        }
-      }
-      if (isAlive) {
-        throw new Error(`Another overnight-workflow process is running (PID ${pid})`);
-      } else {
-        // Stale lock
-        unlinkSync(lockFile);
-      }
+          const current = JSON.parse(readFileSync(lockFile, 'utf8'));
+          if (current.pid === process.pid && current.token === token) unlinkSync(lockFile);
+        } catch { /* ownership changed or already removed */ }
+      };
     } catch (err) {
-      if (err.message.includes('Another overnight-workflow')) throw err;
-      // Stale or unparseable lock file
-      try { unlinkSync(lockFile); } catch {}
+      if (err?.code !== 'EEXIST') throw err;
+      const active = readActiveLock(lockFile);
+      if (active) throw new Error(`overnight workflow already active (pid ${active.pid})`);
+      try { unlinkSync(lockFile); } catch (unlinkErr) {
+        if (unlinkErr?.code !== 'ENOENT') throw unlinkErr;
+      }
     }
   }
-
-  const payload = {
-    pid: process.pid,
-    started_at: new Date().toISOString(),
-  };
-  writeFileSync(lockFile, JSON.stringify(payload, null, 2), 'utf-8');
-
-  return () => {
-    try {
-      if (existsSync(lockFile)) {
-        const lockData = JSON.parse(readFileSync(lockFile, 'utf-8'));
-        if (lockData.pid === process.pid) {
-          unlinkSync(lockFile);
-        }
-      }
-    } catch {}
-  };
+  throw new Error('could not acquire overnight workflow lock');
 }
 
-// ── Timezone / Reset Calculations ────────────────────────────────────
-
-/**
- * Calculates next 1:00 AM America/Phoenix.
- * Phoenix is UTC-7 year-round (no DST), so 1:00 AM Phoenix = 08:00:00 UTC.
- */
 export function getNextPhoenix1AM(now = new Date()) {
-  const utcYear = now.getUTCFullYear();
-  const utcMonth = now.getUTCMonth();
-  const utcDate = now.getUTCDate();
-
-  // Target today at 08:00 UTC
-  let target = new Date(Date.UTC(utcYear, utcMonth, utcDate, 8, 0, 0, 0));
-  if (now.getTime() >= target.getTime()) {
-    // Already past 08:00 UTC today, set to tomorrow at 08:00 UTC
-    target = new Date(Date.UTC(utcYear, utcMonth, utcDate + 1, 8, 0, 0, 0));
-  }
+  let target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 8));
+  if (target <= now) target = new Date(target.getTime() + 86_400_000);
   return target.toISOString();
 }
 
-/**
- * Parses log and error content for reset timestamps.
- * If reliable timestamp found, returns ISO string of reset + 5 minutes.
- * Otherwise returns null.
- */
-export function parseResetTimestamp(logContent) {
-  if (!logContent || typeof logContent !== 'string') return null;
-
-  // 1. Check ISO 8601 timestamps in log e.g. "reset at 2026-07-22T04:00:00Z"
-  const isoMatch = logContent.match(/resets?[_\s]+(?:at\s+)?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/i);
-  if (isoMatch) {
-    const dt = new Date(isoMatch[1]);
-    if (!isNaN(dt.getTime())) {
-      return new Date(dt.getTime() + 5 * 60 * 1000).toISOString();
-    }
-  }
-
-  // 2. Check "resets HH:MMam/pm" format e.g. "resets 04:00am" or "resets 4:00 PM"
-  const timeMatch = logContent.match(/resets?\s+(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)/i);
-  if (timeMatch) {
-    let hours = parseInt(timeMatch[1], 10);
-    const minutes = parseInt(timeMatch[2], 10);
-    const ampm = timeMatch[3].toLowerCase().replace(/\./g, '');
-    if (ampm === 'pm' && hours < 12) hours += 12;
-    if (ampm === 'am' && hours === 12) hours = 0;
-
-    const now = new Date();
-    // Interpret in America/Phoenix (UTC-7)
-    const targetUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hours + 7, minutes, 0, 0));
-    if (now.getTime() >= targetUtc.getTime()) {
-      targetUtc.setUTCDate(targetUtc.getUTCDate() + 1);
-    }
-    return new Date(targetUtc.getTime() + 5 * 60 * 1000).toISOString();
-  }
-
-  // 3. Check "try again in X seconds/minutes/hours" or "retry after X seconds"
-  const retryAfterMatch = logContent.match(/(?:retry|try again|wait)\s+(?:after|in)\s+(\d+)\s*(s|sec|seconds|m|min|minutes|h|hours)/i);
-  if (retryAfterMatch) {
-    const val = parseInt(retryAfterMatch[1], 10);
-    const unit = retryAfterMatch[2].toLowerCase();
-    let ms = val * 1000;
-    if (unit.startsWith('m')) ms = val * 60 * 1000;
-    if (unit.startsWith('h')) ms = val * 3600 * 1000;
-    const now = new Date();
-    return new Date(now.getTime() + ms + 5 * 60 * 1000).toISOString();
-  }
-
-  return null;
+function zonedParts(date, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date);
+  return Object.fromEntries(parts.map(({ type, value }) => [type, value]));
 }
 
-// ── Role Extraction & TSV Management ────────────────────────────────
+function zonedTimeToUtc({ year, month, day, hour, minute }, timeZone) {
+  let guess = Date.UTC(year, month - 1, day, hour, minute);
+  for (let i = 0; i < 3; i++) {
+    const p = zonedParts(new Date(guess), timeZone);
+    const rendered = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
+    guess += Date.UTC(year, month - 1, day, hour, minute) - rendered;
+  }
+  return new Date(guess);
+}
 
-export function parsePipelinePendingRoles(pipelineContent) {
-  if (!pipelineContent || typeof pipelineContent !== 'string') return [];
-  const roles = [];
-  const lines = pipelineContent.split(/\r?\n/);
-  let inPending = false;
-
-  for (const line of lines) {
-    if (line.startsWith('#') || line.startsWith('##')) {
-      const heading = line.toLowerCase();
-      if (heading.includes('pendiente') || heading.includes('pending')) {
-        inPending = true;
-      } else if (heading.includes('procesada') || heading.includes('processed') || heading.includes('descartada')) {
-        inPending = false;
+export function parseResetTimestamp(logContent, now = new Date()) {
+  if (typeof logContent !== 'string' || !logContent) return null;
+  const candidates = [];
+  const isoRe = /(?:reset(?:s|_at)?(?:\s+at)?|available(?:\s+at)?)[:\s]+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))/gi;
+  for (const match of logContent.matchAll(isoRe)) {
+    const date = new Date(match[1]);
+    if (!Number.isNaN(date.getTime()) && date.getTime() >= now.getTime() - 300_000) candidates.push(date);
+  }
+  const clockRe = /resets?\s+(\d{1,2}):(\d{2})\s*([ap]m)(?:\s*\(([^)]+)\))?/gi;
+  for (const match of logContent.matchAll(clockRe)) {
+    let hour = +match[1];
+    if (match[3].toLowerCase() === 'pm' && hour < 12) hour += 12;
+    if (match[3].toLowerCase() === 'am' && hour === 12) hour = 0;
+    const zone = match[4] || 'America/Phoenix';
+    try {
+      const p = zonedParts(now, zone);
+      let date = zonedTimeToUtc({ year: +p.year, month: +p.month, day: +p.day, hour, minute: +match[2] }, zone);
+      if (date <= now) {
+        const tomorrow = new Date(Date.UTC(+p.year, +p.month - 1, +p.day + 1));
+        date = zonedTimeToUtc({ year: tomorrow.getUTCFullYear(), month: tomorrow.getUTCMonth() + 1, day: tomorrow.getUTCDate(), hour, minute: +match[2] }, zone);
       }
+      candidates.push(date);
+    } catch { /* invalid or unavailable IANA timezone is not reliable */ }
+  }
+  const relativeRe = /(?:retry|try again|wait)\s+(?:after|in)\s+(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)/gi;
+  for (const match of logContent.matchAll(relativeRe)) {
+    const unit = match[2].toLowerCase();
+    const multiplier = unit.startsWith('h') ? 3_600_000 : unit.startsWith('m') ? 60_000 : 1_000;
+    candidates.push(new Date(now.getTime() + (+match[1] * multiplier)));
+  }
+  if (!candidates.length) return null;
+  const latest = candidates.sort((a, b) => b - a)[0];
+  return new Date(latest.getTime() + 300_000).toISOString();
+}
+
+export function parsePipelinePendingRoles(content) {
+  if (typeof content !== 'string') return [];
+  const roles = [];
+  let pending = false;
+  for (const raw of content.split(/\r?\n/)) {
+    const heading = raw.match(/^##\s+(.+?)\s*$/);
+    if (heading) {
+      pending = /^(?:pending|pendientes|en attente|offen|bekleyenler|oczekujące|afventer|menunggu|लंबित)$/i.test(heading[1]);
       continue;
     }
-
-    if (!inPending) continue;
-
-    // Match markdown links: - [Title or Company](URL) or - [ ] [Title](URL)
-    const linkMatch = line.match(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/);
-    if (linkMatch) {
-      const title = linkMatch[1].trim();
-      const url = linkMatch[2].trim();
-      roles.push({ title, url, source: 'pipeline' });
+    if (!pending) continue;
+    const item = raw.match(/^- \[ \]\s+(.+)$/);
+    if (!item) continue;
+    const body = item[1].trim();
+    const markdown = body.match(/^\[([^\]]+)\]\((https?:\/\/[^)]+)\)(?:\s*\|\s*(.*))?$/);
+    if (markdown) {
+      roles.push({ url: markdown[2].trim(), company: '', title: markdown[1].trim(), source: 'pipeline' });
+      continue;
+    }
+    const parts = body.split('|').map((part) => part.trim());
+    if (/^(?:https?:\/\/|local:)/i.test(parts[0] || '')) {
+      roles.push({ url: parts[0], company: parts[1] || '', title: parts[2] || '', source: 'pipeline' });
     }
   }
-
   return roles;
 }
 
-export function convertPendingRolesToBatchInput(inputTsvPath, pendingRoles) {
-  mkdirSync(path.dirname(inputTsvPath), { recursive: true });
-  let existingLines = [];
-  if (existsSync(inputTsvPath)) {
-    existingLines = readFileSync(inputTsvPath, 'utf-8').split(/\r?\n/).filter(Boolean);
+export function classifySource(role) {
+  if (BLOCKED_SOURCE_RE.test(`${role?.source || ''} ${role?.company || ''}`)) {
+    return { eligible: false, reason: 'authenticated_source' };
   }
-
-  if (existingLines.length === 0) {
-    existingLines.push('id\turl\tsource\tnotes');
-  }
-
-  const existingUrls = new Set();
-  let maxId = 0;
-
-  for (let i = 1; i < existingLines.length; i++) {
-    const parts = existingLines[i].split('\t');
-    if (parts.length >= 2) {
-      const idNum = parseInt(parts[0], 10);
-      if (!isNaN(idNum) && idNum > maxId) maxId = idNum;
-      existingUrls.add(parts[1].trim());
+  if (String(role?.url || '').startsWith('local:')) return { eligible: true, reason: null };
+  try {
+    const parsed = new URL(role.url);
+    const host = parsed.hostname.toLowerCase();
+    if (parsed.protocol !== 'https:') return { eligible: false, reason: 'non_https_source' };
+    if (BLOCKED_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) {
+      return { eligible: false, reason: 'authenticated_source' };
     }
-  }
-
-  let addedCount = 0;
-  for (const role of pendingRoles) {
-    if (existingUrls.has(role.url)) continue;
-    maxId++;
-    const row = `${maxId}\t${role.url}\t${role.source || 'pipeline'}\t${(role.title || '').replace(/\t/g, ' ')}`;
-    existingLines.push(row);
-    existingUrls.add(role.url);
-    addedCount++;
-  }
-
-  writeFileSync(inputTsvPath, existingLines.join('\n') + '\n', 'utf-8');
-  return { addedCount, totalOffers: existingLines.length - 1 };
+    if (/\/(?:login|signin|auth)(?:\/|$)/i.test(parsed.pathname)) return { eligible: false, reason: 'browser_login_source' };
+    return { eligible: true, reason: null };
+  } catch { return { eligible: false, reason: 'invalid_source' }; }
 }
 
-// ── Supported ATS Detection & Prefill Helper ─────────────────────────
+export function roleIdempotencyKey(url) { return `role_${hash(String(url).trim().toLowerCase())}`; }
+export function cardIdempotencyKey(url) { return `card_${hash(`review:${String(url).trim().toLowerCase()}`)}`; }
+
+function parseBatchInput(file) {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, 'utf8').split(/\r?\n/).slice(1).filter(Boolean).map((line) => {
+    const [id, url, source, notes] = line.split('\t');
+    return { id, url, source, notes };
+  }).filter((row) => /^\d+$/.test(row.id) && row.url);
+}
+
+export function convertPendingRolesToBatchInput(inputFile, roles, { dryRun = false } = {}) {
+  const rows = parseBatchInput(inputFile);
+  const byUrl = new Map(rows.map((row) => [row.url, row]));
+  let max = rows.reduce((n, row) => Math.max(n, +row.id), 0);
+  const added = [];
+  for (const role of roles) {
+    if (byUrl.has(role.url)) continue;
+    const row = { id: String(++max), url: role.url, source: role.source || 'pipeline', notes: `${role.company || ''} | ${role.title || ''}`.replace(/[\t\r\n]/g, ' ') };
+    rows.push(row); byUrl.set(row.url, row); added.push(row);
+  }
+  const content = ['id\turl\tsource\tnotes', ...rows.map((r) => [r.id, r.url, r.source, r.notes].join('\t'))].join('\n') + '\n';
+  if (!dryRun && added.length) atomicWrite(inputFile, content);
+  return { addedCount: added.length, totalOffers: rows.length, rows, added };
+}
+
+export function parseBatchStateRows(file) {
+  if (!existsSync(file)) return [];
+  const lines = readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean);
+  const header = (lines.shift() || '').split('\t');
+  return lines.map((line) => {
+    const values = line.split('\t');
+    return Object.fromEntries(header.map((key, i) => [key, values[i] || '']));
+  }).filter((row) => row.id && row.url && row.status);
+}
 
 export function isSupportedAtsUrl(url) {
-  if (!url) return false;
   try {
-    const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
-    const allowed = [
-      'boards.greenhouse.io',
-      'greenhouse.io',
-      'jobs.ashbyhq.com',
-      'ashbyhq.com',
-      'jobs.lever.co',
-      'jobs.eu.lever.co',
-      'lever.co',
-    ];
-    return allowed.includes(host);
-  } catch {
-    return false;
-  }
+    return new Set(['boards.greenhouse.io', 'greenhouse.io', 'jobs.ashbyhq.com', 'ashbyhq.com', 'jobs.lever.co', 'jobs.eu.lever.co', 'lever.co']).has(new URL(url).hostname.toLowerCase());
+  } catch { return false; }
 }
 
-// ── Review Package Generator ─────────────────────────────────────────
+function reportForRow(reportsDir, reportNum) {
+  if (!/^\d+$/.test(String(reportNum || '')) || !existsSync(reportsDir)) return null;
+  const numeric = +reportNum;
+  const name = readdirSync(reportsDir).find((file) => {
+    const match = file.match(/^(\d+)-.*\.md$/); return match && +match[1] === numeric;
+  });
+  return name ? path.join(reportsDir, name) : null;
+}
 
-export function preparePassedReviewPackages(opts, stateRows) {
+function reportField(content, name) {
+  return content.match(new RegExp(`^\\*\\*${name}:\\*\\*\\s*(.+)$`, 'mi'))?.[1]?.trim() || null;
+}
+
+function reportSection(content, names) {
+  const wanted = new Set(names.map((name) => name.toLowerCase()));
+  const lines = content.split(/\r?\n/);
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const heading = lines[i].match(/^##\s+(.+?)\s*$/);
+    if (heading && wanted.has(heading[1].toLowerCase())) { start = i + 1; break; }
+  }
+  if (start < 0) return null;
+  let end = lines.length;
+  for (let i = start; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) { end = i; break; }
+  }
+  return lines.slice(start, end).join('\n').trim() || null;
+}
+
+function reportDecision(content) {
+  const machine = reportSection(content, ['Machine Summary']);
+  return machine?.match(/^final_decision:\s*["']?([^"'\n]+)["']?\s*$/mi)?.[1]?.trim() || null;
+}
+
+function resolveArtifact(rootDir, expectedRoot, reference) {
+  if (!reference || /not generated/i.test(reference)) return null;
+  const clean = reference.replace(/^`|`$/g, '').split(/\s+/)[0];
+  const absolute = path.resolve(rootDir, clean);
+  const rel = path.relative(path.resolve(expectedRoot), absolute);
+  return (!rel.startsWith('..') && !path.isAbsolute(rel) && existsSync(absolute)) ? absolute : null;
+}
+
+function relativeToRoot(opts, file) { return file ? path.relative(opts.rootDir, file) : null; }
+
+function parseDeadline(content, now) {
+  const matches = [...content.matchAll(/(?:deadline|apply by|closing date)\s*:?\s*(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?)/gi)];
+  const dates = matches.map((m) => new Date(m[1].length === 10 ? `${m[1]}T23:59:59Z` : m[1])).filter((d) => !Number.isNaN(d));
+  if (!dates.length) return { deadline: null, urgent: false };
+  const deadline = dates.sort((a, b) => a - b)[0];
+  return { deadline: deadline.toISOString(), urgent: deadline >= now && deadline.getTime() - now.getTime() <= 172_800_000 };
+}
+
+function preparePassedReviewPackages(opts, rows, generationIds, generationId, errors) {
+  let draftReady = 0, missingArtifact = 0, urgentDeadline = 0;
+  const packages = [];
   const packagesDir = path.join(opts.reportsDir, 'packages');
-  mkdirSync(packagesDir, { recursive: true });
-  mkdirSync(opts.outputDir, { recursive: true });
-
-  let draftReadyCount = 0;
-  let missingArtifactCount = 0;
-  let urgentDeadlineCount = 0;
-
-  for (const row of stateRows) {
-    if (row.status !== 'completed' && row.status !== 'passed') continue;
-
-    const reportNum = row.report_num;
-    let reportFile = null;
-
-    if (existsSync(opts.reportsDir)) {
-      const files = readdirSync(opts.reportsDir);
-      const match = files.find(f => f.startsWith(`${reportNum}-`) && f.endsWith('.md'));
-      if (match) reportFile = path.join(opts.reportsDir, match);
-    }
-
-    const missingArtifacts = [];
-    if (!reportFile || !existsSync(reportFile)) {
-      missingArtifacts.push('report');
-    }
-
-    // Check PDF, cover letter, answers
-    let pdfFile = null;
-    let coverFile = null;
-    let answersFile = null;
-
-    if (existsSync(opts.outputDir)) {
-      const outFiles = readdirSync(opts.outputDir);
-      const pdfMatch = outFiles.find(f => f.endsWith('.pdf') && (f.includes(row.id) || f.includes(reportNum)));
-      if (pdfMatch) pdfFile = path.join(opts.outputDir, pdfMatch);
-
-      const coverMatch = outFiles.find(f => (f.endsWith('.txt') || f.endsWith('.cover.txt')) && (f.includes(row.id) || f.includes(reportNum)));
-      if (coverMatch) coverFile = path.join(opts.outputDir, coverMatch);
-
-      const answersMatch = outFiles.find(f => f.endsWith('.md') && f.includes('answers') && (f.includes(row.id) || f.includes(reportNum)));
-      if (answersMatch) answersFile = path.join(opts.outputDir, answersMatch);
-    }
-
-    // If PDF or cover not found specifically by ID, fall back to any recently created in output/ if available
-    if (!pdfFile && existsSync(opts.outputDir)) {
-      const anyPdf = readdirSync(opts.outputDir).find(f => f.endsWith('.pdf'));
-      if (anyPdf) pdfFile = path.join(opts.outputDir, anyPdf);
-    }
-
-    if (!pdfFile) {
-      missingArtifacts.push('pdf');
-    }
-
-    // Check ATS prefill support
-    let atsPrefillOutput = null;
-    if (isSupportedAtsUrl(row.url) && pdfFile) {
-      const prepareCmd = opts.prepareCmd || `node ${path.join(ROOT_DIR, 'prepare-application.mjs')}`;
-      try {
-        const fullCmd = `${prepareCmd} --url "${row.url}" --pdf "${path.relative(ROOT_DIR, pdfFile)}"`;
-        const res = execSync(fullCmd, { cwd: ROOT_DIR, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
-        atsPrefillOutput = res.trim();
-      } catch (err) {
-        atsPrefillOutput = `Error running ATS prefill: ${err.message}`;
+  for (const row of rows.filter((item) => generationIds.has(item.id) && TERMINAL.has(item.status))) {
+    const report = reportForRow(opts.reportsDir, row.report_num);
+    if (!report) continue;
+    const content = readFileSync(report, 'utf8');
+    if (reportDecision(content)?.toLowerCase() !== 'apply') continue;
+    const roleKey = roleIdempotencyKey(row.url);
+    const cardKey = cardIdempotencyKey(row.url);
+    const artifactDir = path.join(opts.outputDir, 'review-packages', roleKey);
+    const manifestPath = path.join(packagesDir, `${cardKey}.json`);
+    const deadline = parseDeadline(content, opts.now);
+    if (deadline.urgent) urgentDeadline++;
+    const missing = [], artifactErrors = [];
+    let pdf = resolveArtifact(opts.rootDir, opts.outputDir, reportField(content, 'PDF'));
+    const pdfRef = reportField(content, 'PDF');
+    if (!pdf && pdfRef && /\.pdf\b/i.test(pdfRef)) {
+      const pdfTarget = path.resolve(opts.rootDir, pdfRef.replace(/^`|`$/g, '').split(/\s+/)[0]);
+      const html = pdfTarget.replace(/\.pdf$/i, '.html');
+      if (existsSync(html)) {
+        const generated = runCommand(opts.pdfCommand, [html, pdfTarget, `--report=${+row.report_num}`], { cwd: opts.rootDir });
+        if (generated.status === 0) pdf = resolveArtifact(opts.rootDir, opts.outputDir, pdfRef);
+        else artifactErrors.push({ artifact: 'tailored_pdf', code: 'generator_failed' });
       }
     }
+    if (!pdf) missing.push('tailored_pdf');
+    const coverText = reportSection(content, ['Cover Letter Draft']);
+    const answersText = reportSection(content, ['H) Draft Application Answers', 'Application Answers']);
+    let coverFile = null, answersFile = null;
+    mkdirSync(artifactDir, { recursive: true });
+    if (coverText) { coverFile = path.join(artifactDir, 'cover-letter.md'); atomicWrite(coverFile, `${coverText}\n`); } else missing.push('cover_letter');
+    if (answersText) { answersFile = path.join(artifactDir, 'application-answers.md'); atomicWrite(answersFile, `${answersText}\n`); } else missing.push('application_answers');
 
-    // Check deadline / urgent liveness
-    let isUrgent = false;
-    if (reportFile && existsSync(reportFile)) {
-      const content = readFileSync(reportFile, 'utf-8');
-      if (content.toLowerCase().includes('urgent') || content.toLowerCase().includes('deadline')) {
-        isUrgent = true;
-      }
-    }
-    if (isUrgent) urgentDeadlineCount++;
+    const live = runCommand(opts.livenessCommand, [row.url], { cwd: opts.rootDir });
+    const liveOutput = `${live.stdout}\n${live.stderr}`;
+    const liveness = /\bactive\b/i.test(liveOutput) && live.status === 0 ? 'active' : /\bexpired\b/i.test(liveOutput) ? 'expired' : 'uncertain';
+    if (liveness !== 'active') artifactErrors.push({ artifact: 'liveness', code: liveness });
 
-    if (missingArtifacts.length > 0) {
-      missingArtifactCount++;
+    let prefillFile = null;
+    let humanBlocker = null;
+    if (isSupportedAtsUrl(row.url)) {
+      if (pdf && coverFile) {
+        const prepared = runCommand(opts.prepareCommand, ['--url', row.url, '--pdf', relativeToRoot(opts, pdf), '--cover', relativeToRoot(opts, coverFile)], { cwd: opts.rootDir });
+        if (prepared.status === 0) {
+          prefillFile = path.join(artifactDir, 'ats-prefill.txt');
+          atomicWrite(prefillFile, prepared.stdout.slice(0, 64 * 1024));
+        } else artifactErrors.push({ artifact: 'ats_prefill', code: 'preparation_failed' });
+      } else artifactErrors.push({ artifact: 'ats_prefill', code: 'prerequisite_missing' });
     } else {
-      draftReadyCount++;
+      humanBlocker = classifySource(row).eligible ? 'unsupported_ats_manual_prefill' : 'authenticated_portal_manual_review';
+      artifactErrors.push({ artifact: 'ats_prefill', code: humanBlocker });
     }
-
-    const packageManifest = {
-      role_id: row.id,
-      url: row.url,
-      report_num: reportNum,
-      score: row.score,
-      status: 'Passed',
-      report_file: reportFile ? path.relative(ROOT_DIR, reportFile) : null,
-      pdf_file: pdfFile ? path.relative(ROOT_DIR, pdfFile) : null,
-      cover_letter_file: coverFile ? path.relative(ROOT_DIR, coverFile) : null,
-      answers_file: answersFile ? path.relative(ROOT_DIR, answersFile) : null,
-      ats_prefill: atsPrefillOutput,
-      missing_artifacts: missingArtifacts,
-      urgent_deadline: isUrgent,
-      prepared_at: new Date().toISOString(),
+    const ready = missing.length === 0 && artifactErrors.length === 0 && Boolean(prefillFile);
+    if (ready) draftReady++; else missingArtifact++;
+    const manifest = {
+      schema_version: 2, generation_id: generationId, role_key: roleKey, card_key: cardKey,
+      status: 'Passed', draft_ready: ready,
+      artifacts: {
+        report: relativeToRoot(opts, report), tailored_pdf: relativeToRoot(opts, pdf),
+        cover_letter: relativeToRoot(opts, coverFile), application_answers: relativeToRoot(opts, answersFile),
+        ats_prefill: relativeToRoot(opts, prefillFile),
+      },
+      missing, errors: artifactErrors, liveness, deadline: deadline.deadline,
+      urgent_deadline: deadline.urgent, human_blocker: humanBlocker,
     };
-
-    const manifestPath = path.join(packagesDir, `package-${row.id}.json`);
-    writeFileSync(manifestPath, JSON.stringify(packageManifest, null, 2), 'utf-8');
+    atomicWrite(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+    packages.push({ role_key: roleKey, card_key: cardKey, draft_ready: ready });
   }
-
-  return { draftReadyCount, missingArtifactCount, urgentDeadlineCount };
+  return { draftReady, missingArtifact, urgentDeadline, packages };
 }
 
-// ── State Parsing Helpers ────────────────────────────────────────────
-
-export function parseBatchStateRows(stateFilePath) {
-  if (!existsSync(stateFilePath)) return [];
-  const content = readFileSync(stateFilePath, 'utf-8');
-  const lines = content.split(/\r?\n/).filter(Boolean);
-  if (lines.length <= 1) return [];
-
-  const rows = [];
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split('\t');
-    if (parts.length >= 3) {
-      rows.push({
-        id: parts[0],
-        url: parts[1],
-        status: parts[2],
-        started_at: parts[3] || null,
-        completed_at: parts[4] || null,
-        report_num: parts[5] || null,
-        score: parts[6] || null,
-        error: parts[7] || null,
-        retries: parts[8] || '0',
-      });
-    }
-  }
-  return rows;
-}
-
-// ── Main Orchestration ───────────────────────────────────────────────
-
-export async function runOvernightWorkflow(opts = parseArgs()) {
-  const startedAt = new Date().toISOString();
-  const runId = `run-${startedAt.replace(/[-:]/g, '').replace(/\..+/, '')}`;
-  const releaseLock = acquireLock(opts.batchDir);
-
-  const errors = [];
-  let discovered = 0;
-  let autoFiltered = 0;
-  let eligible = 0;
-  let evaluated = 0;
-  let passed = 0;
-  let failed = 0;
-  let paused = 0;
-  let draftReady = 0;
-  let missingArtifact = 0;
-  let urgentDeadline = 0;
-  let resumeAt = null;
-  const idempotencyKeys = [];
-
+function readCheckpoint(file) {
+  if (!existsSync(file)) return { schema_version: 2, runs: [], current: null };
   try {
-    // 1. Run Portal Scan (Public sources only)
-    if (opts.scanCmd) {
-      try {
-        execSync(opts.scanCmd, { cwd: ROOT_DIR, stdio: 'inherit' });
-      } catch (err) {
-        errors.push(`Scan execution failed: ${err.message}`);
-      }
-    } else {
-      const scanScript = path.join(ROOT_DIR, 'scan.mjs');
-      if (existsSync(scanScript)) {
-        try {
-          const scanCmd = `node "${scanScript}"${opts.dryRun ? ' --dry-run' : ''}`;
-          execSync(scanCmd, { cwd: ROOT_DIR, stdio: 'pipe' });
-        } catch (err) {
-          errors.push(`Portal scan error: ${err.message}`);
-        }
-      }
+    const value = JSON.parse(readFileSync(file, 'utf8'));
+    if (Array.isArray(value.runs)) return value;
+    return { schema_version: 2, runs: value.run_id ? [value] : [], current: value.run_id ? value : null };
+  } catch { return { schema_version: 2, runs: [], current: null }; }
+}
+
+function boundedKeys(packages, roles) {
+  const roleKeys = [...new Set(roles.map((role) => roleIdempotencyKey(role.url)))];
+  const cardKeys = [...new Set(packages.map((item) => item.card_key))];
+  return {
+    role_keys: roleKeys.slice(0, SUMMARY_KEY_LIMIT), role_keys_omitted: Math.max(0, roleKeys.length - SUMMARY_KEY_LIMIT),
+    card_keys: cardKeys.slice(0, SUMMARY_KEY_LIMIT), card_keys_omitted: Math.max(0, cardKeys.length - SUMMARY_KEY_LIMIT),
+  };
+}
+
+function recentPauseLogs(opts, pausedRows, startedAt) {
+  const pieces = [];
+  const pauseFile = path.join(opts.batchDir, 'batch-runner.paused');
+  if (existsSync(pauseFile) && statSync(pauseFile).mtimeMs >= startedAt.getTime() - 1000) pieces.push(readFileSync(pauseFile, 'utf8'));
+  const logsDir = path.join(opts.batchDir, 'logs');
+  if (existsSync(logsDir)) {
+    const ids = new Set(pausedRows.map((row) => String(row.id)));
+    const files = readdirSync(logsDir).map((name) => path.join(logsDir, name))
+      .filter((file) => { try { return statSync(file).isFile() && statSync(file).mtimeMs >= startedAt.getTime() - 1000; } catch { return false; } })
+      .filter((file) => ids.size === 0 || [...ids].some((id) => path.basename(file).includes(`-${id}`)))
+      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs).slice(0, 5);
+    for (const file of files) pieces.push(readFileSync(file, 'utf8').slice(-32 * 1024));
+  }
+  return pieces.join('\n');
+}
+
+export async function runOvernightWorkflow(input = {}) {
+  const opts = normalizeOptions(input);
+  const startedAt = new Date(opts.now);
+  let releaseLock = () => {};
+  if (!opts.dryRun) releaseLock = acquireLock(opts.lockFile, startedAt);
+  const errors = [];
+  let summary;
+  try {
+    const scan = runCommand(opts.scanCommand, ['--public-only', ...(opts.dryRun ? ['--dry-run'] : [])], { cwd: opts.rootDir });
+    if (scan.status !== 0) addError(errors, `scan failure: ${scan.stderr || scan.error || scan.stdout}`);
+    const dedup = runCommand(opts.dedupCommand, opts.dryRun ? ['--dry-run'] : [], { cwd: opts.rootDir });
+    if (dedup.status !== 0) addError(errors, `dedup failure: ${dedup.stderr || dedup.error || dedup.stdout}`);
+
+    const pending = existsSync(opts.pipelineFile) ? parsePipelinePendingRoles(readFileSync(opts.pipelineFile, 'utf8')) : [];
+    const unique = [...new Map(pending.map((role) => [role.url, role])).values()];
+    const eligibleRoles = [], blockedRoles = [];
+    for (const role of unique) (classifySource(role).eligible ? eligibleRoles : blockedRoles).push(role);
+    const converted = convertPendingRolesToBatchInput(opts.inputFile, eligibleRoles, { dryRun: opts.dryRun });
+    const beforeState = parseBatchStateRows(opts.stateFile);
+    const unfinishedIds = new Set(beforeState.filter((row) => !TERMINAL.has(row.status)).map((row) => row.id));
+    const generationRows = converted.rows.filter((row) => eligibleRoles.some((role) => role.url === row.url) || unfinishedIds.has(row.id));
+    const generationIds = new Set(generationRows.map((row) => row.id));
+    const generationId = `gen_${hash(generationRows.map((row) => roleIdempotencyKey(row.url)).sort().join('\n') || 'empty')}`;
+
+    const runnerArgs = ['--cli', 'agy', '--parallel', '2', '--limit', '0', '--rate-limit-sleep', '0', '--resume-paused'];
+    if (opts.dryRun) runnerArgs.push('--dry-run');
+    const runner = runCommand(opts.runnerCommand, runnerArgs, { cwd: opts.rootDir });
+    if (runner.status !== 0 && !/(?:paused|rate limit|session limit)/i.test(`${runner.stdout}\n${runner.stderr}`)) {
+      addError(errors, `runner failure: ${runner.stderr || runner.error || runner.stdout}`);
+    }
+    if (!opts.dryRun) {
+      const reconcile = runCommand(opts.reconcileCommand, ['--state', opts.stateFile, '--pipeline', opts.pipelineFile], { cwd: opts.rootDir });
+      if (reconcile.status !== 0) addError(errors, `reconcile failure: ${reconcile.stderr || reconcile.error || reconcile.stdout}`);
+      const verify = runCommand(opts.verifyCommand, [], { cwd: opts.rootDir });
+      if (verify.status !== 0) addError(errors, `verification failure: ${verify.stderr || verify.error || verify.stdout}`);
     }
 
-    // 2. Run Pre-batch Deduplication
-    const dedupScript = path.join(ROOT_DIR, 'dedup-tracker.mjs');
-    if (existsSync(dedupScript)) {
-      try {
-        execSync(`node "${dedupScript}" --dry-run`, { cwd: ROOT_DIR, stdio: 'pipe' });
-      } catch (err) {
-        errors.push(`Dedup check error: ${err.message}`);
-      }
-    }
-
-    // 3. Extract pending roles from pipeline.md & convert to batch-input.tsv
-    let pendingRoles = [];
-    if (existsSync(opts.pipelineFile)) {
-      const pipelineContent = readFileSync(opts.pipelineFile, 'utf-8');
-      pendingRoles = parsePipelinePendingRoles(pipelineContent);
-    }
-    discovered = pendingRoles.length;
-    eligible = pendingRoles.length;
-
-    const inputTsvPath = path.join(opts.batchDir, 'batch-input.tsv');
-    const { totalOffers } = convertPendingRolesToBatchInput(inputTsvPath, pendingRoles);
-
-    // Collect idempotency keys
-    for (const role of pendingRoles) {
-      idempotencyKeys.push(`role-${role.url}`);
-    }
-
-    // 4. Run Batch Runner
-    const runnerCmd = opts.runnerCmd || `${path.join(opts.batchDir, 'batch-runner.sh')} --cli agy --parallel 2 --limit 0 --rate-limit-sleep 0 --resume-paused`;
-    const finalRunnerCmd = opts.dryRun ? `${runnerCmd} --dry-run` : runnerCmd;
-
-    try {
-      execSync(finalRunnerCmd, { cwd: ROOT_DIR, stdio: 'inherit' });
-    } catch (err) {
-      // Runner might exit non-zero on rate limit or failures, which is captured in state
-      if (!err.message.includes('paused') && !err.message.includes('rate limit')) {
-        errors.push(`Batch runner warning/failure: ${err.message}`);
-      }
-    }
-
-    // 5. Post-evaluation Reconcile and Verification
-    const reconcileScript = path.join(ROOT_DIR, 'reconcile-pipeline.mjs');
-    if (existsSync(reconcileScript)) {
-      try {
-        execSync(`node "${reconcileScript}" --state "${opts.stateFile}" --pipeline "${opts.pipelineFile}"`, { cwd: ROOT_DIR, stdio: 'pipe' });
-      } catch (err) {
-        errors.push(`Pipeline reconcile error: ${err.message}`);
-      }
-    }
-
-    const verifyScript = path.join(ROOT_DIR, 'verify-pipeline.mjs');
-    if (existsSync(verifyScript)) {
-      try {
-        execSync(`node "${verifyScript}"`, { cwd: ROOT_DIR, stdio: 'pipe' });
-      } catch (err) {
-        errors.push(`Pipeline verification warning: ${err.message}`);
-      }
-    }
-
-    // 6. Inspect batch-state.tsv for metrics & paused status
     const stateRows = parseBatchStateRows(opts.stateFile);
-    for (const row of stateRows) {
-      if (row.status === 'completed') {
-        evaluated++;
-        const scoreNum = parseFloat(row.score);
-        if (!isNaN(scoreNum) && scoreNum >= 3.5) {
-          passed++;
-        }
-      } else if (row.status === 'skipped') {
-        autoFiltered++;
-      } else if (row.status === 'failed') {
-        evaluated++;
-        failed++;
-      } else if (row.status === 'paused_rate_limit' || row.status === 'rate_limited') {
-        paused++;
-      }
+    const scoped = stateRows.filter((row) => generationIds.has(row.id));
+    const completed = scoped.filter((row) => row.status === 'completed');
+    const skipped = scoped.filter((row) => row.status === 'skipped');
+    const failedRows = scoped.filter((row) => row.status === 'failed');
+    const pausedRows = scoped.filter((row) => /^(?:paused_rate_limit|rate_limited)$/.test(row.status));
+    const unrecoverable = failedRows.filter((row) => Number(row.retries || 0) >= 2 || /(?:fatal|unrecoverable|provider)/i.test(row.error || ''));
+    if (unrecoverable.length) addError(errors, `unrecoverable provider failure count: ${unrecoverable.length}`);
+    const passedRows = completed.filter((row) => {
+      const report = reportForRow(opts.reportsDir, row.report_num);
+      return report && reportDecision(readFileSync(report, 'utf8'))?.toLowerCase() === 'apply';
+    });
+    let packages = { draftReady: 0, missingArtifact: 0, urgentDeadline: 0, packages: [] };
+    if (!opts.dryRun) packages = preparePassedReviewPackages(opts, stateRows, generationIds, generationId, errors);
+    const reset = pausedRows.length ? parseResetTimestamp(`${runner.stdout}\n${runner.stderr}\n${recentPauseLogs(opts, pausedRows, startedAt)}`, startedAt) : null;
+    const keys = boundedKeys(packages.packages, generationRows);
+    summary = {
+      schema_version: 2, run_id: `run_${hash(`${generationId}:${startedAt.toISOString()}`)}`, generation_id: generationId,
+      started_at: startedAt.toISOString(), completed_at: new Date().toISOString(), dry_run: opts.dryRun,
+      discovered: unique.length, auto_filtered: skipped.length + blockedRoles.length, eligible: generationRows.length,
+      evaluated: completed.length + failedRows.length + skipped.length, passed: passedRows.length,
+      failed: failedRows.length, paused: pausedRows.length, draft_ready: packages.draftReady,
+      missing_artifact: packages.missingArtifact, urgent_deadline: packages.urgentDeadline,
+      authenticated_blockers: blockedRoles.length, ...keys,
+      resume_at: pausedRows.length ? (reset || getNextPhoenix1AM(startedAt)) : null,
+      errors,
+    };
+    if (!opts.dryRun) {
+      const persisted = readCheckpoint(opts.checkpointFile);
+      const prior = persisted.runs.filter((run) => run.generation_id !== generationId);
+      persisted.runs = [...prior, summary].slice(-32);
+      persisted.current = summary;
+      atomicWrite(opts.checkpointFile, JSON.stringify(persisted, null, 2) + '\n');
     }
-
-    // Check for pause reset timestamp if paused > 0
-    if (paused > 0) {
-      let pauseLogContent = '';
-      const pauseFile = path.join(opts.batchDir, 'batch-runner.paused');
-      if (existsSync(pauseFile)) {
-        pauseLogContent += readFileSync(pauseFile, 'utf-8') + '\n';
-      }
-
-      const logsDir = path.join(opts.batchDir, 'logs');
-      if (existsSync(logsDir)) {
-        const logFiles = readdirSync(logsDir);
-        for (const lf of logFiles.slice(-5)) {
-          try {
-            pauseLogContent += readFileSync(path.join(logsDir, lf), 'utf-8') + '\n';
-          } catch {}
-        }
-      }
-
-      const parsedReset = parseResetTimestamp(pauseLogContent);
-      if (parsedReset) {
-        resumeAt = parsedReset;
-      } else {
-        resumeAt = getNextPhoenix1AM();
-      }
-    }
-
-    // 7. Prepare Passed Review Packages
-    const packageMetrics = preparePassedReviewPackages(opts, stateRows);
-    draftReady = packageMetrics.draftReadyCount;
-    missingArtifact = packageMetrics.missingArtifactCount;
-    urgentDeadline = packageMetrics.urgentDeadlineCount;
-
   } finally {
+    // The production lock is intentionally held through the atomic checkpoint write.
     releaseLock();
   }
-
-  const completedAt = new Date().toISOString();
-  const summary = {
-    run_id: runId,
-    started_at: startedAt,
-    completed_at: completedAt,
-    discovered,
-    auto_filtered: autoFiltered,
-    eligible,
-    evaluated,
-    passed,
-    failed,
-    paused,
-    draft_ready: draftReady,
-    missing_artifact: missingArtifact,
-    urgent_deadline: urgentDeadline,
-    idempotency_keys: idempotencyKeys,
-    resume_at: resumeAt,
-    errors,
-  };
-
-  // Persist checkpoint JSON
-  mkdirSync(path.dirname(opts.checkpointFile), { recursive: true });
-  writeFileSync(opts.checkpointFile, JSON.stringify(summary, null, 2), 'utf-8');
-
-  // Output
-  if (opts.json) {
-    console.log(JSON.stringify(summary, null, 2));
-  } else {
-    console.log(`=== Overnight Workflow Summary (${summary.run_id}) ===`);
-    console.log(`Status: ${summary.errors.length > 0 ? 'Completed with warnings' : 'Completed'}`);
-    console.log(`Discovered: ${summary.discovered} | Eligible: ${summary.eligible} | Evaluated: ${summary.evaluated}`);
-    console.log(`Passed: ${summary.passed} | Failed: ${summary.failed} | Paused: ${summary.paused}`);
-    console.log(`Draft Ready: ${summary.draft_ready} | Missing Artifacts: ${summary.missing_artifact} | Urgent Deadlines: ${summary.urgent_deadline}`);
-    if (summary.resume_at) {
-      console.log(`Resume At: ${summary.resume_at}`);
-    }
-    if (summary.errors.length > 0) {
-      console.log(`Errors/Warnings (${summary.errors.length}):`);
-      for (const err of summary.errors) {
-        console.log(`  - ${err}`);
-      }
-    }
+  if (opts.json) console.log(JSON.stringify(summary));
+  else {
+    console.log(`Overnight ${summary.dry_run ? 'dry run' : 'run'} ${summary.generation_id}: ${summary.eligible} eligible, ${summary.evaluated} evaluated, ${summary.passed} passed.`);
+    console.log(`Draft-ready ${summary.draft_ready}; missing artifacts ${summary.missing_artifact}; paused ${summary.paused}.`);
+    if (summary.resume_at) console.log(`Resume at ${summary.resume_at}.`);
+    if (summary.errors.length) console.log(`${summary.errors.length} bounded error(s); run with --json for codes.`);
   }
-
   return summary;
 }
 
+function parseArgs(argv = process.argv.slice(2)) {
+  const input = { dryRun: false, json: false };
+  const values = new Map([
+    ['--data-dir', 'dataDir'], ['--batch-dir', 'batchDir'], ['--reports-dir', 'reportsDir'],
+    ['--output-dir', 'outputDir'], ['--pipeline-file', 'pipelineFile'], ['--state-file', 'stateFile'],
+    ['--checkpoint-file', 'checkpointFile'], ['--scan-command', 'scanCommand'],
+    ['--runner-command', 'runnerCommand'], ['--prepare-command', 'prepareCommand'], ['--liveness-command', 'livenessCommand'],
+  ]);
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--dry-run') input.dryRun = true;
+    else if (argv[i] === '--json') input.json = true;
+    else if (values.has(argv[i]) && argv[i + 1]) input[values.get(argv[i])] = argv[++i];
+  }
+  return input;
+}
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
-  runOvernightWorkflow().catch((err) => {
-    console.error('Fatal overnight-workflow error:', err.message);
-    process.exit(1);
-  });
+  runOvernightWorkflow(parseArgs()).catch((err) => { console.error(`overnight workflow failed: ${safeError(err.message)}`); process.exit(1); });
 }
