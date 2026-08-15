@@ -21,6 +21,7 @@ type Catalog struct {
 	TabEvaluated string
 	TabApplied   string
 	TabInterview string
+	TabResponded string
 	TabTop       string
 	TabSkip      string
 	TabRejected  string
@@ -34,6 +35,7 @@ type Catalog struct {
 	ColStatus   string
 	ColLocation string
 	ColPay      string
+	ColPosted   string
 	ColLast     string
 
 	// Preview labels
@@ -170,13 +172,16 @@ func (c *Catalog) ViewModeLabel(mode string) string {
 }
 
 // StatusLabel returns the localized display label for a canonical status ID
-// (interview, offer, responded, applied, evaluated, skip, rejected, discarded).
+// (interview, offer, hired, responded, applied, evaluated, skip, rejected,
+// discarded).
 func (c *Catalog) StatusLabel(norm string) string {
 	switch strings.ToLower(strings.TrimSpace(norm)) {
 	case "interview":
 		return c.StatusInterview
 	case "offer":
 		return c.StatusOffer
+	case "hired":
+		return c.StatusHired
 	case "responded":
 		return c.StatusResponded
 	case "applied":
@@ -231,6 +236,7 @@ var En = Catalog{
 	TabEvaluated: "EVALUATED",
 	TabApplied:   "APPLIED",
 	TabInterview: "INTERVIEW",
+	TabResponded: "RESPONDED",
 	TabTop:       "TOP ≥4",
 	TabSkip:      "SKIP",
 	TabRejected:  "REJECTED",
@@ -244,6 +250,7 @@ var En = Catalog{
 	ColStatus:   "STATUS",
 	ColLocation: "LOCATION",
 	ColPay:      "PAY",
+	ColPosted:   "POSTED",
 	ColLast:     "LAST",
 
 	// Preview labels
@@ -358,6 +365,7 @@ var Tr = Catalog{
 	TabEvaluated: "DEĞERLENDİRİLDİ",
 	TabApplied:   "BAŞVURULDU",
 	TabInterview: "MÜLAKAT",
+	TabResponded: "YANIT VERİLDİ",
 	TabTop:       "EN İYİ ≥4",
 	TabSkip:      "UYGUN DEĞİL",
 	TabRejected:  "REDDEDİLDİ",
@@ -371,6 +379,7 @@ var Tr = Catalog{
 	ColStatus:   "DURUM",
 	ColLocation: "KONUM",
 	ColPay:      "ÜCRET",
+	ColPosted:   "YAYIN",
 	ColLast:     "SON",
 
 	// Preview labels
@@ -485,6 +494,7 @@ var Es = Catalog{
 	TabEvaluated: "EVALUADAS",
 	TabApplied:   "APLICADAS",
 	TabInterview: "ENTREVISTA",
+	TabResponded: "RESPONDIDAS",
 	TabTop:       "TOP ≥4",
 	TabSkip:      "OMITIR",
 	TabRejected:  "RECHAZADAS",
@@ -498,6 +508,7 @@ var Es = Catalog{
 	ColStatus:   "ESTADO",
 	ColLocation: "UBICACIÓN",
 	ColPay:      "SALARIO",
+	ColPosted:   "PUBLIC.",
 	ColLast:     "ÚLTIMO",
 
 	// Preview labels
