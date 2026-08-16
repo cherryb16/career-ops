@@ -1,0 +1,21 @@
+{
+  "score": 1,
+  "archetype": "Legal/Contracts Management",
+  "fit_notes": "Candidate's background is in operations, RevOps, automation, and entrepreneurship — not contract management or legal transactions. The role requires 7+ years contract management experience with 3+ years in technology transactions/vendor agreements. Candidate appears to be a recent/recent graduate (Amazon internship dated May-Aug 2026). Strong operational/analytical skills (SQL, Salesforce, Power Automate, process improvement) but no demonstrated experience drafting/negotiating SaaS agreements, IP licensing, or procurement contracts.",
+  "concerns": [
+    "Massive experience gap: role requires 7+ years contract management; candidate has 0 years",
+    "Wrong function: this is a legal/commercial contracts role, not Strategy & Ops, Business Analyst, or Ops Manager",
+    "Location mismatch: role is SF/NYC hybrid (25% office); candidate in Provo, UT",
+    "Compensation mismatch: role $170-220K vs candidate target $70-130K",
+    "Skill mismatch: needs contract drafting/negotiation, SaaS/IP licensing; candidate has RevOps/automation/analytics"
+  ],
+  "recommendation": "SKIP",
+  "blocks": {
+    "A": 1,
+    "B": 1,
+    "C": 1,
+    "D": 1,
+    "E": 2,
+    "F": 1
+  }
+}

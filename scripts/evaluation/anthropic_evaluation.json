@@ -1,0 +1,30 @@
+{
+  "score": 2,
+  "archetype": "Hardware Operations / Data Center Infrastructure Lead",
+  "fit_notes": [
+    "Amazon Area Manager Intern demonstrates relevant operations management experience (3-site quality project, $500K/week impact, tool deployment across NA/EU)",
+    "Storage Scholars shows operations leadership ($20K revenue, 6-person crew, 30% efficiency gain)",
+    "ShadowRock RevOps demonstrates analytical/RevOps skills (SQL unification across 6 platforms, 50% visibility improvement, Salesforce integration)",
+    "ASARCO shows process automation expertise (Power Automate, 20hr/mo saved, 80% error reduction)",
+    "Strong academic background (BYU Marriott Strategic Management, 3.93 GPA, ACT 35)",
+    "Open to relocation from Provo, UT"
+  ],
+  "concerns": [
+    "Role is specialized Data Center Hardware Operations for AI infrastructure (GPUs/TPUs, hardware procurement, vendor management, capacity planning) - candidate has zero direct data center hardware experience",
+    "Candidate background is fulfillment/logistics operations (Amazon FC), small business ops (Storage Scholars), RevOps/analytics (ShadowRock), and HR automation (ASARCO) - not hardware/infrastructure operations",
+    "Anthropic is an AI research company - this role likely requires deep knowledge of AI compute hardware (H100s, TPUs, networking, liquid cooling, power density)",
+    "Candidate targets Management Consulting, Strategy & Ops, Business Analyst, APM, Ops Manager ($70-130K) - this is a specialized hardware infrastructure lead role likely paying $180K-$250K+",
+    "Location mismatch: Anthropic offices in SF/Seattle/NYC/London; candidate in Provo, UT (open to relocation but significant move)",
+    "Role requires hardware vendor management, supply chain, data center operations, capacity planning - none in candidate background",
+    "Seniority mismatch: 'Lead' role typically requires 7+ years hardware/DC experience; candidate is recent grad (intern 2026)"
+  ],
+  "recommendation": "SKIP",
+  "blocks": {
+    "A_role_fit": 2,
+    "B_experience_match": 1,
+    "C_skills_match": 2,
+    "D_location_fit": 2,
+    "E_compensation_fit": 1,
+    "F_seniority_fit": 1
+  }
+}

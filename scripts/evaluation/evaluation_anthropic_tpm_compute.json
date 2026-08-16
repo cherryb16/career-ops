@@ -1,0 +1,32 @@
+{
+  "score": 1.7,
+  "archetype": "Technical Program Manager (TPM) — Severe mismatch (Senior/Principal level vs. Early Career)",
+  "fit_notes": "Candidate has ~1.5 years of internship/part-time experience (Amazon Area Manager Intern upcoming May-Aug 2026, BYU Ballard Center, ShadowRock RevOps, ASARCO, Storage Scholars). Role requires 7+ years TPM experience in infrastructure/platform engineering/compute-intensive environments. Candidate's background is operations/RevOps/automation/entrepreneurship — no TPM, infrastructure, or compute experience. Anthropic is a top-tier AI company with strong mission alignment (AI safety), and candidate has AI chatbot project experience, but the seniority gap is unbridgeable for this role.",
+  "concerns": [
+    "CRITICAL: 7+ years TPM experience required vs. candidate's ~1.5 years internship experience — 5.5x experience gap",
+    "CRITICAL: Compensation $290K-$365K vs. candidate target $70K-$130K (2.2x-5.2x mismatch)",
+    "CRITICAL: Role is Senior/Principal TPM level; candidate is early-career (pre-graduation, graduating ~2026)",
+    "Location requires relocation from Provo, UT to SF/NYC/Seattle (hybrid 25% in-office) — feasible but adds friction",
+    "No visa sponsorship issues (sponsorship available), but experience gap makes this moot",
+    "Rolling deadline but application would be non-competitive given experience mismatch"
+  ],
+  "recommendation": "SKIP",
+  "blocks": {
+    "A": 1,
+    "B": 1,
+    "C": 2,
+    "D": 3,
+    "E": 4,
+    "F": 1
+  },
+  "block_evidence": {
+    "A": "Role Fit (30%): Score 1/5. Job requires 7+ years TPM in infrastructure/platform engineering/compute-intensive environments. Candidate has ~1.5 years internship/part-time experience (Amazon Area Manager Intern, Ballard Center, ShadowRock RevOps, ASARCO, Storage Scholars) — all operations, RevOps, automation, entrepreneurship. Zero TPM, infrastructure, or compute experience. Severe seniority mismatch.",
+    "B": "Compensation (15%): Score 1/5. Role pays $290,000-$365,000 base salary. Candidate target is $70,000-$130,000. Role compensation is 2.2x-5.2x candidate's target range. This is a senior/principal-level compensation band.",
+    "C": "Growth (20%): Score 2/5. Anthropic is a top-tier AI company with excellent brand and growth trajectory. However, this role is for a senior TPM — candidate would be severely underqualified. No entry-level growth path in this specific role. For candidate's actual level, should target APM, Junior TPM, Business Analyst, or Strategy & Ops roles.",
+    "D": "Culture (10%): Score 3/5. Anthropic has strong mission-driven culture (AI safety), hybrid model (25% in-office) in SF/NYC/Seattle. Candidate open to relocation, so neutral. Glassdoor ratings generally positive for mission alignment and technical challenge.",
+    "E": "Mission (10%): Score 4/5. Anthropic mission ('reliable, interpretable, steerable AI systems... safe and beneficial') aligns well with candidate's demonstrated interest in AI (Ballard Center Rags to Robes AI chatbot) and impact-driven work (Amazon $500K/wk impact, ShadowRock 25% pitch lift, ASARCO 25% turnover reduction). Strong values alignment.",
+    "F": "Red Flags (15%): Score 1/5. CRITICAL: 7+ years experience requirement vs ~1.5 years actual experience. CRITICAL: Compensation 2.2x-5.2x target range. CRITICAL: Senior/Principal role vs early-career candidate. Location relocation required. Rolling deadline but application would be non-competitive. Multiple deal-breakers."
+  },
+  "overall_calculation": "(1*0.30) + (1*0.15) + (2*0.20) + (3*0.10) + (4*0.10) + (1*0.15) = 0.30 + 0.15 + 0.40 + 0.30 + 0.40 + 0.15 = 1.70",
+  "recommendation_reason": "Candidate is dramatically underqualified for this Senior/Principal TPM role (7+ years exp required vs ~1.5 years internship experience). Compensation is 2-5x target range. Should target entry-level APM, Business Analyst, Strategy & Ops, or Junior TPM roles at Anthropic or similar companies instead."
+}

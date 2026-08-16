@@ -1,0 +1,15 @@
+{
+  "score": 1,
+  "archetype": "Senior Technical Program Manager (TPM III / L6) - Amazon Ads Media Planning",
+  "fit_notes": "Candidate has strong academic credentials (BYU Marriott, 3.93 GPA, ACT 35) and impressive internship/project experience including Amazon Area Manager Intern (upcoming May-Aug 2026), Ballard Center projects (Airtable CRM, AI chatbot), ShadowRock RevOps (Salesforce, SQL), ASARCO (Power Automate), and Storage Scholars entrepreneurship. Strong ops/analytics/automation background with SQL, Power Automate, Airtable, and some AI exposure. Amazon internship is a strong signal. However, candidate targets entry/mid-level roles (Consulting, Strategy & Ops, BA, APM, Ops Manager) at $70-130K.",
+  "concerns": "Major experience mismatch: role requires 5+ years TPM experience + 3+ years software development experience (Sr. TPM III / L6 level). Candidate appears to be a current student/recent grad with internship experience only (Amazon internship May-Aug 2026 is upcoming/future). Compensation mismatch: Sr. TPM L6 at Amazon Ads likely $180-250K+ vs candidate $70-130K target. Location mismatch: Amazon Ads Media Planning roles typically in Seattle/NYC/Bay Area; candidate in Provo, UT (remote/hybrid unclear). Role is deeply technical (DSP, Ads Planner, ML/AI platforms, system design) requiring 3+ years SDE experience - candidate has SQL/Power Automate/Airtable but not 3+ years SDE experience. Application deadline July 11, 2026 conflicts with candidate's Amazon internship timing (May-Aug 2026).",
+  "recommendation": "SKIP",
+  "blocks": {
+    "A": 1,
+    "B": 1,
+    "C": 3,
+    "D": 2,
+    "E": 1,
+    "F": 1
+  }
+}

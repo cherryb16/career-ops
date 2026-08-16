@@ -1,0 +1,29 @@
+{
+  "score": 2,
+  "archetype": "Hardware Supply Chain / NPI Program Management (NOT a match for target archetypes: Management Consulting, Strategy & Ops, Business Analyst, APM, Ops Manager)",
+  "fit_notes": "Candidate is a BYU Strategic Management student (graduating ~2026) with strong ops/analytics internships (Amazon Area Manager, ShadowRock RevOps, ASARCO automation, Storage Scholars entrepreneurship). This role is a SENIOR NPI Sourcing/Supply Chain PM requiring 6-8 years of hardware manufacturing/sourcing experience, located in Austin/Seattle (not remote). The candidate's background is in process improvement, data analysis, RevOps, and early-stage ops — not deep hardware supply chain. Amazon internship is a plus but doesn't bridge the 8-year experience gap.",
+  "concerns": [
+    "CRITICAL: Senior role requires 6+ years industry experience and 8+ years in data analysis/high-volume manufacturing — candidate is a student with internships only",
+    "Function mismatch: Role is specialized hardware supply chain (power/cooling equipment for data centers) vs. candidate's target of consulting/strategy/PM/ops",
+    "Location mismatch: Austin TX or Seattle WA only (20% travel), candidate in Provo UT (open to relocation but not for a role they're unqualified for)",
+    "Wrong career trajectory: This role leads to senior hardware procurement/supply chain leadership, not MBB/Strategy/APM exits",
+    "Comp likely $150K+ base + RSU (Sr. level) — above candidate's $70-130K target but irrelevant given qualification gap"
+  ],
+  "recommendation": "SKIP",
+  "blocks": {
+    "A": 1,
+    "B": 3,
+    "C": 3,
+    "D": 3,
+    "E": 2,
+    "F": 4
+  },
+  "block_rationale": {
+    "A": "Score 1 (Poor match - wrong level AND function). Role requires 8+ years hardware manufacturing/sourcing experience; candidate is a student with internships. Function is specialized NPI supply chain for power/cooling equipment — not consulting, strategy, PM, or general ops.",
+    "B": "Score 3 (Slightly above target). Amazon Sr. PM total comp likely $180K+ (base $150K+ + RSU + bonus). Above candidate's $70-130K range but moot given qualification gap.",
+    "C": "Score 3 (Adequate but wrong vector). Strong Amazon brand and internal mobility, but growth path is hardware supply chain leadership — not aligned with candidate's consulting/strategy/APM targets.",
+    "D": "Score 3 (Neutral). Candidate knows Amazon culture from internship. AWS Infrastructure known for high operational tempo; 'work-life harmony' messaging but reality is demanding.",
+    "E": "Score 2 (Weak alignment). Mission is 'keeping the cloud running' via hardware procurement. Candidate's demonstrated interests: RevOps, AI/automation, entrepreneurship, process improvement — not data center power/cooling supply chain.",
+    "F": "Score 4 (Minor concerns). Legitimate Amazon role, no ethical/legal red flags. Concerns: significant experience mismatch (student vs. 8+ yr req), location inflexibility, narrow specialization limiting exits."
+  }
+}
