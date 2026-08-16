@@ -118,4 +118,4 @@ package-lock.json
 plan/
 
 # Web
-.career-ops-web/logo-cache/
+.career-ops-web/logo-cache/data/.overnight-checkpoint.json
