@@ -5,10 +5,8 @@ set -euo pipefail
 # Reads batch-input.tsv, delegates each offer to a claude -p worker,
 # tracks state in batch-state.tsv for resumability.
 #
-# NOTE: This script is Claude Code-specific. It uses claude -p with
-# --dangerously-skip-permissions and --append-system-prompt-file flags
-# that are not available in other CLIs. Multi-CLI support is out of scope
-# for now — contributions welcome.
+# NOTE: This script supports multiple CLIs. Claude uses --permission-mode auto,
+# AGY uses --dangerously-skip-permissions, Hermes uses --yolo.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -189,16 +187,14 @@ check_prerequisites() {
       fi
       ;;
     agy)
-      AGY_CLI="/Users/mac_studio/.local/bin/agy"
-      if [[ ! -x "$AGY_CLI" ]]; then
-        echo "ERROR: 'agy' CLI not found at $AGY_CLI"
+      if ! command -v agy >/dev/null 2>&1; then
+        echo "ERROR: 'agy' CLI not found in PATH. Install Antigravity CLI or use --cli claude."
         exit 1
       fi
       ;;
     claude)
-      CLAUDE_CLI="/Users/mac_studio/.local/bin/claude"
-      if [[ ! -x "$CLAUDE_CLI" ]]; then
-        echo "ERROR: 'claude' CLI not found at $CLAUDE_CLI"
+      if ! command -v claude >/dev/null 2>&1; then
+        echo "ERROR: 'claude' CLI not found in PATH. Install Claude Code or use --cli agy."
         exit 1
       fi
       ;;
@@ -580,7 +576,7 @@ process_offer() {
   # approvals (like claude's --dangerously-skip-permissions), --accept-hooks =
   # auto-approve shell hooks for headless runs. AGENTS.md is auto-loaded from CWD
   # by Hermes, so we pass the resolved prompt as the oneshot payload.
-  # For Claude: -p = oneshot, --dangerously-skip-permissions = bypass approvals,
+  # For Claude: -p = oneshot, --permission-mode auto = bypass approvals,
   # --strict-mcp-config = no MCP servers (avoids Playwright deadlock with --parallel > 1).
   local -a worker_args=()
   case "$CLI" in
@@ -589,11 +585,7 @@ process_offer() {
       # files appended) + the actual prompt. We embed both as the oneshot message.
       local payload
       payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
-      worker_args=(-z "$payload" --yolo --accept-hooks)
-      # Use OpenRouter with a tool-capable model. The local Darkbloom 20B model
-      # cannot do tool calling (read_file, write_file, web_search, terminal),
-      # which the batch worker requires for the A-G evaluation pipeline.
-      worker_args+=(--provider openrouter --model z-ai/glm-5.2)
+      worker_args=(-z "$payload" --yolo --accept-hooks --provider nous --model poolside/laguna-xs-2.1:free)
       # Ensure required toolsets are enabled (web search, file ops, terminal, browser, code)
       worker_args+=(-t web,file,terminal,browser,code_execution)
       ;;
@@ -604,8 +596,13 @@ process_offer() {
       local agy_payload
       agy_payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
       worker_args=(-p "$agy_payload" --dangerously-skip-permissions)
-      # Use Gemini 3.5 Flash (Medium) — fast, tool-capable, cost-effective
-      worker_args+=(--model "Gemini 3.5 Flash (Medium)")
+      # Resolve model: use --model override if passed, otherwise default to
+      # Gemini 3.5 Flash (Medium) — fast, tool-capable, cost-effective
+      if [[ -n "$RESOLVED_MODEL" ]]; then
+        worker_args+=(--model "$RESOLVED_MODEL")
+      else
+        worker_args+=(--model "Gemini 3.5 Flash (Medium)")
+      fi
       # Increase print timeout to 15 minutes for complex multi-step evaluations
       worker_args+=(--print-timeout 15m)
       # Per-worker log file for debugging
@@ -613,7 +610,7 @@ process_offer() {
       ;;
     claude|*)
       # Default: Claude Code
-      worker_args=(-p --dangerously-skip-permissions --strict-mcp-config)
+      worker_args=(-p --permission-mode auto --strict-mcp-config)
       if [[ -n "$RESOLVED_MODEL" ]]; then
         worker_args+=(--model "$RESOLVED_MODEL")
       fi
@@ -632,10 +629,10 @@ process_offer() {
         hermes "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
       agy)
-        /Users/mac_studio/.local/bin/agy "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        agy "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
       claude|*)
-        /Users/mac_studio/.local/bin/claude "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        claude "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
     esac
 
@@ -899,10 +896,10 @@ main() {
 
   resolve_worker_model
 
-  # For Hermes, we don't use the spend_tier model resolution - Hermes uses its own config.yaml
+  # For Hermes, we use explicit provider and model from worker_args
   if [[ "$CLI" == "hermes" ]]; then
-    RESOLVED_MODEL="(uses Hermes config.yaml model)"
-    RESOLVED_SPEND_TIER="hermes"
+    RESOLVED_MODEL="poolside/laguna-xs-2.1:free"
+    RESOLVED_SPEND_TIER="nous"
   fi
 
   if [[ "$DRY_RUN" == "false" ]]; then
