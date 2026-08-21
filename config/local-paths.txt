@@ -1,0 +1,4 @@
+# local-paths.txt — files this checkout owns, that upstream does not ship.
+#
+# Custom provider — Management Consulted job board integration
+providers/management-consulted.mjs
