@@ -193,3 +193,6 @@ data/intake-state.json
 # that is no longer present as a live pattern.
 voice-dna.md
 .worktrees/
+
+# Fork-only provider (kept on disk, backed up in documents/providers/)
+providers/management-consulted.mjs
