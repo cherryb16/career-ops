@@ -192,3 +192,4 @@ data/intake-state.json
 # them guard files holding personal data, and the next update re-adds any
 # that is no longer present as a live pattern.
 voice-dna.md
+.worktrees/

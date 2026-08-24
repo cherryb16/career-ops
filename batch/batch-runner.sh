@@ -53,7 +53,7 @@ is_decimal_number() {
 
 usage() {
   cat <<'USAGE'
-career-ops batch runner — process job offers in batch via headless workers (default: hermes)
+career-ops batch runner — process job offers in batch via headless workers (default: agy)
 Uses spend_tier from config/profile.yml unless --model overrides it.
 
 Usage: batch-runner.sh [OPTIONS]
