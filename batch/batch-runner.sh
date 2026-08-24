@@ -364,12 +364,14 @@ read_spend_tier() {
   esac
 }
 
-# Tier -> model mapping. Keep in sync with the table in modes/_shared.md.
+# Tier -> model mapping for the Claude CLI. Uses stable family aliases
+# ('haiku'/'sonnet'/'opus') so each tier always tracks the latest model in
+# that family without a script change. Keep in sync with modes/_shared.md.
 spend_tier_to_model() {
   case "$1" in
-    economy) echo "claude-haiku-4-5" ;;
-    premium) echo "claude-opus-4-8" ;;
-    standard|*) echo "claude-sonnet-4-6" ;;
+    economy) echo "haiku" ;;
+    premium) echo "opus" ;;
+    standard|*) echo "sonnet" ;;
   esac
 }
 
