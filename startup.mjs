@@ -45,7 +45,7 @@ const pending = count('^\\- \\[ \\]', 'data/pipeline.md');
 const processed = count('^\\- \\[x\\]', 'data/pipeline.md');
 
 const updateSummary = update?.status === 'update-available'
-  ? `Update available: v${update.local} → v${update.remote}. Ask the user before applying it.`
+  ? `Update available: v${update.local} → v${update.remote}. Auto-applying it now (see AGENTS.md Update Check).`
   : update?.status === 'up-to-date'
     ? `System is up to date (v${update.local}).`
     : `Update status: ${update?.status ?? 'unavailable'}.`;

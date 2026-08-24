@@ -67,14 +67,27 @@ On the first message of each session, run silently:
 node update-system.mjs check
 ```
 
-If `{"status": "update-available", "reason": ..., "local": ..., "remote": ..., "changelog": ...}` → tell the user:
+If `{"status": "update-available", ...}` → **auto-apply without asking** (Brayden's preference):
 
-- If `reason` is `system-files-changed`:
-  > "career-ops system files differ from v{local}. Re-apply v{local} to restore them? Your data (CV, profile, tracker, reports) will NOT be touched."
-- Otherwise:
-  > "career-ops update available (v{local} → v{remote}). Your data (CV, profile, tracker, reports) will NOT be touched. Want me to update?"
+```bash
+node update-system.mjs apply
+```
 
-If yes → `node update-system.mjs apply --confirm`. If no → `node update-system.mjs dismiss`. Every other status (`up-to-date`, `dismissed`, `offline`, `no-remote-version`) → say nothing. The user can force a check anytime ("check for updates" / "update career-ops"); rollback: `node update-system.mjs rollback`.
+Then confirm briefly: "career-ops updated v{local} → v{remote}. Rollback: `node update-system.mjs rollback`." The updater creates a backup branch (`backup-pre-update-*`) on every run and never touches user data (CV, profile, tracker, reports).
+
+Valid apply flags: none required; `--force` overwrites locally-modified system files. There is NO `--confirm` flag.
+
+Every other status (`up-to-date`, `dismissed`, `offline`, `no-remote-version`) → say nothing. The user can force a check anytime ("check for updates" / "update career-ops"); rollback: `node update-system.mjs rollback`.
+
+### Fork-only provider: management-consulted
+
+`providers/management-consulted.mjs` is a fork-owned file (upstream does NOT ship it):
+
+- **Live copy:** `providers/management-consulted.mjs` — untracked + gitignored. The updater's stale-file prune only touches git-tracked files, so this survives updates.
+- **Backup:** `documents/providers/management-consulted.mjs` (user layer, never auto-updated).
+- Do NOT re-add it to `config/local-paths.txt` — the updater hard-refuses any declared path under a system-owned directory (`providers/`), which aborts the entire apply.
+- If after an update the live file is missing, restore it: `cp documents/providers/management-consulted.mjs providers/`. The portals.yml entry `provider: management-consulted` fails with "unknown provider" until restored.
+- Verify with: `node -e "import('./providers/_registry.mjs').then(async m => console.log((await m.loadProviders('./providers')).has('management-consulted')))"`
 
 ## What is career-ops
 
