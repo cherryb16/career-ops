@@ -1246,20 +1246,25 @@ main() {
         break
       fi
 
-      # Wait if we're at parallel limit
+      # Wait if we're at parallel limit (guard: pids can be empty when both
+      # workers in the first wave exited before PID recording — expanding an
+      # empty array aborts under `set -u` on bash < 4.4)
       while (( running >= PARALLEL )); do
-        # Wait for any child to finish
-        for j in "${!pids[@]}"; do
-          if ! kill -0 "${pids[$j]}" 2>/dev/null; then
-            wait "${pids[$j]}" 2>/dev/null || true
-            unset 'pids[j]'
-            unset 'pid_ids[j]'
-            running=$((running - 1))
-          fi
-        done
-        # Compact arrays
-        pids=("${pids[@]}")
-        pid_ids=("${pid_ids[@]}")
+        if (( ${#pids[@]} > 0 )); then
+          for j in "${!pids[@]}"; do
+            if ! kill -0 "${pids[$j]}" 2>/dev/null; then
+              wait "${pids[$j]}" 2>/dev/null || true
+              unset 'pids[j]'
+              unset 'pid_ids[j]'
+              running=$((running - 1))
+            fi
+          done
+          # Compact arrays
+          pids=("${pids[@]}")
+          pid_ids=("${pid_ids[@]}")
+        else
+          sleep 1
+        fi
         if [[ "$BATCH_PAUSED" == "true" || -f "$PAUSE_FILE" ]]; then
           echo "=== Batch paused: session/rate limit reached. Waiting for running workers, not scheduling new offers. ==="
           break
