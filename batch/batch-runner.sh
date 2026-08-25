@@ -787,13 +787,14 @@ process_offer() {
       local agy_payload
       agy_payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
       worker_args=(-p "$agy_payload" --dangerously-skip-permissions)
-      # Resolve model: use --model override if passed. Default to the Claude
-      # usage class — agy meters Gemini separately from Claude/GPT, and the
-      # Gemini pool is exhausted until ~Aug 31 while Claude/GPT have headroom.
+      # Resolve model: use --model override if passed. Default to Gemini 3.5
+      # Flash (Medium) — fast, tool-capable, cost-effective. NOTE: agy meters
+      # Gemini separately from the Claude/GPT usage classes; when one pool is
+      # exhausted, pass --model with a model from the other class.
       if [[ -n "$RESOLVED_MODEL" ]]; then
         worker_args+=(--model "$RESOLVED_MODEL")
       else
-        worker_args+=(--model "Claude Sonnet 4.6 (Thinking)")
+        worker_args+=(--model "Gemini 3.5 Flash (Medium)")
       fi
       # Increase print timeout to 15 minutes for complex multi-step evaluations
       worker_args+=(--print-timeout 15m)
