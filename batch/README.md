@@ -104,9 +104,18 @@ If the Bitwarden secret is ever recreated, point the runner at the new id:
 export BWS_CLAUDE_TOKEN_SECRET_ID=<new-secret-id>
 ```
 
+## Codex Auth (`--cli codex`)
+
+Codex workers use ChatGPT OAuth stored in `~/.codex/auth.json` — there is no token env var (unlike Claude Code). The runner probes `codex login status` before launching; if not logged in, run `codex login` interactively once.
+
+Worker invocation: `codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --ignore-user-config -m <model> -` with the prompt piped via stdin (`-`). `--ignore-user-config` skips ambient `config.toml` MCP servers to avoid the Playwright deadlock under `--parallel > 1`.
+
+Model selection: spend_tier maps via `codex_model_alias()` — `economy`/`standard` → `gpt-5.6-luna`, `premium` → `gpt-5.6-sol`. ChatGPT accounts reject ids like `gpt-5.1-codex`; verify any change with a one-shot first. Override per-run with `--model <codex-model-id>`.
+
 ## Prerequisites
 
 - Your CLI in PATH (see **Headless / Batch Mode** table in `AGENTS.md`)
 - For `--cli claude`: either `CLAUDE_CODE_OAUTH_TOKEN` exported, or `bws` installed and logged in with the token stored as secret `CLAUDE_CODE_OAUTH_TOKEN`
+- For `--cli codex`: `codex login` completed once (ChatGPT OAuth); the runner verifies with `codex login status`
 - Node.js >= 18, Playwright chromium installed (`npm run doctor` to verify)
 - `batch-input.tsv` with at least one offer
