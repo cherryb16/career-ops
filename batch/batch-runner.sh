@@ -790,10 +790,14 @@ process_offer() {
       local agy_payload
       agy_payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
       worker_args=(-p "$agy_payload" --dangerously-skip-permissions)
-      # Resolve model: use --model override if passed; otherwise pick the
-      # default for this variant's usage class.
-      if [[ -n "$RESOLVED_MODEL" ]]; then
-        worker_args+=(--model "$RESOLVED_MODEL")
+      # Resolve model: --model override wins, else the variant's usage-class
+      # default. RESOLVED_MODEL is a Claude *CLI* model id (e.g. claude-sonnet-5)
+      # resolved from spend_tier — it is NOT valid for agy, which wants display
+      # names like "Claude Sonnet 4.6 (Thinking)". So only use it for claude;
+      # agy variants always take their class default unless the user passed
+      # --model explicitly (MODEL, not RESOLVED_MODEL).
+      if [[ -n "$MODEL" ]]; then
+        worker_args+=(--model "$MODEL")
       elif [[ "$CLI" == "agy-other" ]]; then
         worker_args+=(--model "Claude Sonnet 4.6 (Thinking)")
       else
