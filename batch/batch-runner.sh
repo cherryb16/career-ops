@@ -61,7 +61,7 @@ Usage: batch-runner.sh [OPTIONS]
 
 Options:
   --cli NAME           Worker CLI: agy (Gemini pool), agy-google (same as agy),
-                       agy-other (Claude pool), claude, or hermes (default: agy)
+                       agy-other (Claude pool), claude, codex, or hermes (default: agy)
   --parallel N         Number of parallel workers (default: 1)
   --dry-run            Show what would be processed, don't execute
   --retry-failed       Only retry offers marked as "failed" in state
@@ -168,6 +168,56 @@ release_lock() {
 
 trap release_lock EXIT
 
+# Resolve Claude Code auth for headless workers.
+# Interactive `claude auth login` state does not apply to `claude -p` workers in
+# all contexts; the supported path is the CLAUDE_CODE_OAUTH_TOKEN env var
+# (produced by `claude setup-token`). On this machine that token lives in
+# Bitwarden Secrets Manager as CLAUDE_CODE_OAUTH_TOKEN, so if the env var is not
+# already exported we fetch it with `bws` (never printed, never written to disk).
+ensure_claude_auth() {
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    return 0
+  fi
+
+  local bws_bin secret_id
+  bws_bin="$(command -v bws || true)"
+  if [[ -z "$bws_bin" ]]; then
+    echo "WARN: CLAUDE_CODE_OAUTH_TOKEN not set and 'bws' (Bitwarden Secrets Manager) not found."
+    echo "      Falling back to whatever auth the claude CLI already has. If workers fail"
+    echo "      with auth errors, run 'claude setup-token' and export CLAUDE_CODE_OAUTH_TOKEN,"
+    echo "      or store the token in Bitwarden as secret CLAUDE_CODE_OAUTH_TOKEN."
+    return 0
+  fi
+
+  # Allow override via env in case the secret id changes.
+  secret_id="${BWS_CLAUDE_TOKEN_SECRET_ID:-80ca912d-f62a-4bd7-b8f6-b4b101305c35}"
+  local fetched=""
+  fetched="$("$bws_bin" secret get "$secret_id" --output json 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('value',''))" 2>/dev/null || true)"
+  if [[ -n "$fetched" ]]; then
+    export CLAUDE_CODE_OAUTH_TOKEN="$fetched"
+    echo "INFO: CLAUDE_CODE_OAUTH_TOKEN resolved from Bitwarden Secrets Manager."
+  else
+    echo "WARN: Could not fetch CLAUDE_CODE_OAUTH_TOKEN from Bitwarden (secret $secret_id)."
+    echo "      Falling back to existing claude CLI auth."
+  fi
+}
+
+# Verify Codex CLI headless auth. Codex uses ChatGPT OAuth stored in
+# ~/.codex/auth.json — there is no token env var, so we can only probe.
+ensure_codex_auth() {
+  if codex login status >/dev/null 2>&1; then
+    return 0
+  fi
+  # login status exits nonzero when logged out; check output to be sure.
+  if codex login status 2>&1 | grep -qi "logged in"; then
+    return 0
+  fi
+  echo "ERROR: Codex CLI is not logged in. Run 'codex login' interactively first"
+  echo "       (browser OAuth), or use --cli agy / --cli claude."
+  exit 1
+}
+
 # Validate prerequisites
 check_prerequisites() {
   if [[ ! -f "$INPUT_FILE" ]]; then
@@ -199,9 +249,17 @@ check_prerequisites() {
         echo "ERROR: 'claude' CLI not found in PATH. Install Claude Code or use --cli agy."
         exit 1
       fi
+      ensure_claude_auth
+      ;;
+    codex)
+      if ! command -v codex >/dev/null 2>&1; then
+        echo "ERROR: 'codex' CLI not found in PATH. Install Codex CLI or use --cli agy."
+        exit 1
+      fi
+      ensure_codex_auth
       ;;
     *)
-      echo "ERROR: Unsupported --cli '$CLI'. Supported: agy, agy-google, agy-other, claude, hermes"
+      echo "ERROR: Unsupported --cli '$CLI'. Supported: agy, agy-google, agy-other, claude, codex, hermes"
       exit 1
       ;;
   esac
@@ -373,6 +431,20 @@ spend_tier_to_model() {
     economy) echo "haiku" ;;
     premium) echo "opus" ;;
     standard|*) echo "sonnet" ;;
+  esac
+}
+
+# Map a Claude CLI model alias (haiku/sonnet/opus from spend_tier_to_model)
+# to the Codex CLI's -m values. Codex is GPT-family only, so every tier maps
+# to the closest GPT tier; --model with an explicit codex id always wins.
+# Defaults follow this install's ~/.codex/config.toml (gpt-5.6-luna) — ChatGPT
+# accounts reject ids like 'gpt-5.1-codex', so verify with a one-shot before
+# changing these.
+codex_model_alias() {
+  case "$1" in
+    haiku) echo "gpt-5.6-luna" ;;
+    opus) echo "gpt-5.6-sol" ;;
+    sonnet|*) echo "gpt-5.6-luna" ;;
   esac
 }
 
@@ -770,6 +842,11 @@ process_offer() {
   # by Hermes, so we pass the resolved prompt as the oneshot payload.
   # For Claude: -p = oneshot, --permission-mode auto = bypass approvals,
   # --strict-mcp-config = no MCP servers (avoids Playwright deadlock with --parallel > 1).
+  # For Codex: exec = non-interactive, --dangerously-bypass-approvals-and-sandbox =
+  # no approval prompts and full disk/network (workers need web + Playwright),
+  # --skip-git-repo-check, --ignore-user-config = skip ambient config.toml MCP
+  # servers (same deadlock concern as claude's --strict-mcp-config). The prompt
+  # is piped via stdin to avoid argv-length limits on long resolved prompts.
   local -a worker_args=()
   case "$CLI" in
     hermes)
@@ -808,8 +885,21 @@ process_offer() {
       # Per-worker log file for debugging
       worker_args+=(--log-file "$LOGS_DIR/${report_num}-${id}-agy.log")
       ;;
+    codex)
+      # Codex CLI: exec = non-interactive. Prompt goes on stdin (see launch
+      # below); resolved system-prompt file is concatenated ahead of the prompt.
+      worker_args=(exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check)
+      # Don't load ambient config.toml MCP servers (Playwright deadlock with
+      # --parallel > 1), same intent as claude's --strict-mcp-config.
+      worker_args+=(--ignore-user-config)
+      if [[ -n "$MODEL" ]]; then
+        worker_args+=(-m "$MODEL")
+      elif [[ -n "$RESOLVED_MODEL" ]]; then
+        worker_args+=(-m "$(codex_model_alias "$RESOLVED_MODEL")")
+      fi
+      ;;
     claude|*)
-      # Default: Claude Code
+      # Default: Claude Code. NOTE: must stay LAST — it's the catch-all.
       worker_args=(-p --permission-mode auto --strict-mcp-config)
       if [[ -n "$RESOLVED_MODEL" ]]; then
         worker_args+=(--model "$RESOLVED_MODEL")
@@ -831,6 +921,12 @@ process_offer() {
       agy|agy-google|agy-other)
         agy "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
+      codex)
+        # Prompt piped via stdin ('-' = read from stdin): the resolved system
+        # prompt file is large and argv-length limits bite on long prompts.
+        { cat "$resolved_prompt"; printf '\n\n---\n\n%s\n' "$prompt"; } \
+          | codex "${worker_args[@]}" - > "$log_file" 2>&1 || exit_code=$?
+        ;;
       claude|*)
         claude "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
@@ -844,6 +940,16 @@ process_offer() {
     case "$CLI" in
       hermes)
         # Hermes-specific retry logic can be added here if needed
+        ;;
+      codex)
+        # Codex streamable-http MCP session teardown can log an rmcp HTTP 400
+        # after a successful run; only retry on genuine transport failures.
+        if [[ $exit_code -ne 0 ]] && grep -q "stream error.*unexpected status" "$log_file" && (( shim_retries < max_shim_retries )); then
+          shim_retries=$((shim_retries + 1))
+          echo "    ⏳ Codex stream error. Retrying in 30s (attempt $shim_retries/$max_shim_retries)..."
+          sleep 30
+          continue
+        fi
         ;;
       claude|*)
         # Check for Claude Code npm shim swap (exit code 127 + command not found)

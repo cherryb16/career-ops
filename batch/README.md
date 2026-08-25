@@ -88,8 +88,25 @@ Batch mode reads offers from `batch-input.tsv`, but the `data/pipeline.md` inbox
 
 A PID-based lock file (`batch-runner.pid`) prevents concurrent batch runs. If a previous run crashed, the stale lock is detected and removed automatically.
 
+## Claude Code Auth (`--cli claude`)
+
+`claude -p` workers authenticate with the `CLAUDE_CODE_OAUTH_TOKEN` env var (a long-lived token produced once by `claude setup-token`). The interactive `claude auth login` session does **not** apply to headless workers.
+
+On this machine the token is stored in **Bitwarden Secrets Manager** as secret `CLAUDE_CODE_OAUTH_TOKEN`. When you run with `--cli claude`, batch-runner automatically:
+
+1. Uses an already-exported `CLAUDE_CODE_OAUTH_TOKEN` if present, otherwise
+2. Fetches it from Bitwarden via `bws` (never printed, never written to disk), otherwise
+3. Falls back to whatever auth the claude CLI already has, with a warning.
+
+If the Bitwarden secret is ever recreated, point the runner at the new id:
+
+```bash
+export BWS_CLAUDE_TOKEN_SECRET_ID=<new-secret-id>
+```
+
 ## Prerequisites
 
 - Your CLI in PATH (see **Headless / Batch Mode** table in `AGENTS.md`)
+- For `--cli claude`: either `CLAUDE_CODE_OAUTH_TOKEN` exported, or `bws` installed and logged in with the token stored as secret `CLAUDE_CODE_OAUTH_TOKEN`
 - Node.js >= 18, Playwright chromium installed (`npm run doctor` to verify)
 - `batch-input.tsv` with at least one offer
