@@ -60,7 +60,8 @@ Uses spend_tier from config/profile.yml unless --model overrides it.
 Usage: batch-runner.sh [OPTIONS]
 
 Options:
-  --cli NAME           Worker CLI: hermes, agy, or claude (default: agy)
+  --cli NAME           Worker CLI: agy (Gemini pool), agy-google (same as agy),
+                       agy-other (Claude pool), claude, or hermes (default: agy)
   --parallel N         Number of parallel workers (default: 1)
   --dry-run            Show what would be processed, don't execute
   --retry-failed       Only retry offers marked as "failed" in state
@@ -187,7 +188,7 @@ check_prerequisites() {
         exit 1
       fi
       ;;
-    agy)
+    agy|agy-google|agy-other)
       if ! command -v agy >/dev/null 2>&1; then
         echo "ERROR: 'agy' CLI not found in PATH. Install Antigravity CLI or use --cli claude."
         exit 1
@@ -200,7 +201,7 @@ check_prerequisites() {
       fi
       ;;
     *)
-      echo "ERROR: Unsupported --cli '$CLI'. Supported: hermes, agy, claude"
+      echo "ERROR: Unsupported --cli '$CLI'. Supported: agy, agy-google, agy-other, claude, hermes"
       exit 1
       ;;
   esac
@@ -780,19 +781,21 @@ process_offer() {
       # Ensure required toolsets are enabled (web search, file ops, terminal, browser, code)
       worker_args+=(-t web,file,terminal,browser,code_execution)
       ;;
-    agy)
+    agy|agy-google|agy-other)
       # Antigravity CLI: -p = print mode (non-interactive), --dangerously-skip-permissions
-      # = auto-approve all tool requests. Uses Gemini models (default: Gemini 3.5 Flash High).
-      # AGY auto-loads AGENTS.md from CWD. The resolved prompt is passed as the prompt text.
+      # = auto-approve all tool requests. AGY auto-loads AGENTS.md from CWD.
+      # Two usage-class variants (agy meters Gemini separately from Claude/GPT):
+      #   agy / agy-google → Gemini 3.5 Flash (Medium)  [Gemini pool]
+      #   agy-other        → Claude Sonnet 4.6 Thinking [Claude pool]
       local agy_payload
       agy_payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
       worker_args=(-p "$agy_payload" --dangerously-skip-permissions)
-      # Resolve model: use --model override if passed. Default to Gemini 3.5
-      # Flash (Medium) — fast, tool-capable, cost-effective. NOTE: agy meters
-      # Gemini separately from the Claude/GPT usage classes; when one pool is
-      # exhausted, pass --model with a model from the other class.
+      # Resolve model: use --model override if passed; otherwise pick the
+      # default for this variant's usage class.
       if [[ -n "$RESOLVED_MODEL" ]]; then
         worker_args+=(--model "$RESOLVED_MODEL")
+      elif [[ "$CLI" == "agy-other" ]]; then
+        worker_args+=(--model "Claude Sonnet 4.6 (Thinking)")
       else
         worker_args+=(--model "Gemini 3.5 Flash (Medium)")
       fi
@@ -821,7 +824,7 @@ process_offer() {
       hermes)
         hermes "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
-      agy)
+      agy|agy-google|agy-other)
         agy "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
       claude|*)
