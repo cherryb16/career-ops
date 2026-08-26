@@ -289,7 +289,11 @@ function extractRole(reportContent) {
 }
 
 const reportFiles = existsSync(REPORTS_DIR)
-  ? readdirSync(REPORTS_DIR).filter(f => REPORT_FILE_RE.test(f))
+  ? readdirSync(REPORTS_DIR, { recursive: true })
+      .filter(f => REPORT_FILE_RE.test(f))
+      // Files under archive/ are superseded evaluations of re-posted jobs —
+      // kept for history but exempt from orphan/duplicate checks.
+      .filter(f => !f.startsWith('archive/'))
   : [];
 
 let dupReports = 0;
