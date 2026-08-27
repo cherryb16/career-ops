@@ -1369,9 +1369,20 @@ main() {
               running=$((running - 1))
             fi
           done
-          # Compact arrays
-          pids=("${pids[@]}")
-          pid_ids=("${pid_ids[@]}")
+          # Compact arrays. Guard: if every element was just unset above, the
+          # array is now fully empty, and expanding "${pids[@]}" on a fully
+          # empty array aborts with "unbound variable" under `set -u` on
+          # bash 3.2 (macOS default) even though bash 4.4+ handles it fine.
+          if (( ${#pids[@]} > 0 )); then
+            pids=("${pids[@]}")
+          else
+            pids=()
+          fi
+          if (( ${#pid_ids[@]} > 0 )); then
+            pid_ids=("${pid_ids[@]}")
+          else
+            pid_ids=()
+          fi
         else
           sleep 1
         fi
