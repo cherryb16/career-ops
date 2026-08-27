@@ -735,7 +735,13 @@ is_rate_limit_log() {
 
 is_session_limit_log() {
   local log_file="$1"
-  grep -Eiq '(session limit|resets [0-9:]+[ap]m|usage limit|limit[[:space:]]+reached)' "$log_file"
+  # "Individual quota reached...Resets in Xh" is agy's Gemini/Claude usage-class
+  # exhaustion message — same shape as the other session-limit strings (a hard
+  # stop with its own reset clock), not a transient rate limit worth retrying
+  # within this run. Without "quota reached" here it fell through to
+  # is_rate_limit_log (which only matched "quota exceeded", different wording)
+  # and burned through MAX_RETRIES marking every remaining offer "failed".
+  grep -Eiq '(session limit|resets [0-9:]+[ap]m|usage limit|limit[[:space:]]+reached|quota[[:space:]]+reached)' "$log_file"
 }
 
 mark_paused_rate_limit() {
@@ -932,6 +938,34 @@ process_offer() {
         ;;
     esac
 
+    # Rate/session-limit detection must run BEFORE the exit_code==0 fast path:
+    # some CLIs (observed with hermes) exit 0 even when the underlying API
+    # call failed (e.g. "API call failed after 3 retries: HTTP 429" printed
+    # to the log), so gating this on a nonzero exit code let 429s silently
+    # get marked "completed" with no report file. Always inspect the log.
+    if is_session_limit_log "$log_file"; then
+      mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
+      echo "    ⏸️  Session/rate limit reached; pausing batch without consuming retry budget."
+      terminal_failure_recorded=true
+      break
+    fi
+
+    if is_rate_limit_log "$log_file" && (( retries < MAX_RETRIES )); then
+      if (( RATE_LIMIT_SLEEP <= 0 )); then
+        mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
+        echo "    ⏸️  Rate limited and --rate-limit-sleep is 0; pausing batch without consuming retry budget."
+        terminal_failure_recorded=true
+        break
+      fi
+      retries=$((retries + 1))
+      local retry_completed_at
+      retry_completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      update_state_retrying "$id" "$url" "rate_limited" "$started_at" "$retry_completed_at" "$report_num" "-" "rate-limit; retrying after ${RATE_LIMIT_SLEEP}s" "$retries"
+      echo "    ⏳ Rate limited (attempt $retries/$MAX_RETRIES). Waiting ${RATE_LIMIT_SLEEP}s before retry..."
+      sleep "$RATE_LIMIT_SLEEP"
+      continue
+    fi
+
     if [[ $exit_code -eq 0 ]]; then
       break
     fi
@@ -962,29 +996,6 @@ process_offer() {
         ;;
     esac
 
-    if is_session_limit_log "$log_file"; then
-      mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
-      echo "    ⏸️  Session/rate limit reached; pausing batch without consuming retry budget."
-      terminal_failure_recorded=true
-      break
-    fi
-
-    if is_rate_limit_log "$log_file" && (( retries < MAX_RETRIES )); then
-      if (( RATE_LIMIT_SLEEP <= 0 )); then
-        mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
-        echo "    ⏸️  Rate limited and --rate-limit-sleep is 0; pausing batch without consuming retry budget."
-        terminal_failure_recorded=true
-        break
-      fi
-      retries=$((retries + 1))
-      local retry_completed_at
-      retry_completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-      update_state_retrying "$id" "$url" "rate_limited" "$started_at" "$retry_completed_at" "$report_num" "-" "rate-limit; retrying after ${RATE_LIMIT_SLEEP}s" "$retries"
-      echo "    ⏳ Rate limited (attempt $retries/$MAX_RETRIES). Waiting ${RATE_LIMIT_SLEEP}s before retry..."
-      sleep "$RATE_LIMIT_SLEEP"
-      continue
-    fi
-
     break
   done
 
@@ -995,7 +1006,18 @@ process_offer() {
   local completed_at
   completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-  if [[ $exit_code -eq 0 ]]; then
+  # Detect the worker's own hard-stop JSON fence: some prompts (e.g. dead
+  # URL / empty JD) correctly refuse to score and emit
+  # {"status": "failed", ...} while still exiting 0. Treat that as a real
+  # failure so it retries/surfaces instead of being recorded "completed"
+  # with a dash score and no report file (silently invisible in the
+  # pipeline once max-retries suppresses it from future runs).
+  local worker_reported_failed=false
+  if grep -q '"status"[[:space:]]*:[[:space:]]*"failed"' "$log_file" 2>/dev/null; then
+    worker_reported_failed=true
+  fi
+
+  if [[ $exit_code -eq 0 && "$worker_reported_failed" == "false" ]]; then
     # Try to extract score from worker output
     local score="-"
     local score_match
