@@ -1046,7 +1046,39 @@ process_offer() {
     worker_reported_failed=true
   fi
 
-  if [[ $exit_code -eq 0 && "$worker_reported_failed" == "false" ]]; then
+  # Verify the worker's claimed report file actually exists on disk. Two
+  # failure modes observed in practice both exit 0 with no "status":"failed"
+  # string, so neither is caught by the check above: (1) the model narrates
+  # a full success summary — including a specific reports/NNNN-*.md path —
+  # that it never actually wrote (a file-write hallucination); (2) a garbled/
+  # truncated response ("Model generated invalid tool call: shell") that
+  # never reaches the JSON fence at all, leaving no score and no file. Both
+  # were previously recorded "completed" with a dash score, silently
+  # dropping the offer from the pipeline. A genuinely successful run always
+  # writes reports/${report_num}-*.md regardless of score (SKIP recommendations
+  # get a report too) — so require that file to exist before trusting the log.
+  # A brief settle-retry guards against a write-then-stat visibility race: a
+  # worker process can exit (and our exit_code capture happen) a beat before
+  # its last file write is visible to a fresh glob in this shell — observed
+  # in practice discarding a fully complete, valid 95K-token report as a
+  # false "missing" only seconds after the worker's own process exited. A
+  # genuine hallucination/failure never produces the file even after waiting,
+  # so this retry costs real hallucinations nothing while saving real ones.
+  local worker_report_missing=false
+  if [[ -n "$report_num" && "$report_num" != "-" ]]; then
+    local report_glob=("$REPORTS_DIR/${report_num}-"*.md)
+    local settle_attempt=0
+    while [[ ! -f "${report_glob[0]}" && $settle_attempt -lt 3 ]]; do
+      sleep 1
+      report_glob=("$REPORTS_DIR/${report_num}-"*.md)
+      settle_attempt=$((settle_attempt + 1))
+    done
+    if [[ ! -f "${report_glob[0]}" ]]; then
+      worker_report_missing=true
+    fi
+  fi
+
+  if [[ $exit_code -eq 0 && "$worker_reported_failed" == "false" && "$worker_report_missing" == "false" ]]; then
     # Try to extract score from worker output
     local score="-"
     local score_match
