@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.23.1](https://github.com/cherryb16/career-ops/compare/career-ops-v1.23.0...career-ops-v1.23.1) (2026-08-27)
+
+
+### Bug Fixes
+
+* **batch-runner:** stop silent false-completions on rate-limit/quota/hard-stop ([fbdf72b](https://github.com/cherryb16/career-ops/commit/fbdf72bdcff3bc940d0cc440ab9ad182582997cd))
+* **evaluation:** enforce hard-block score caps for seniority/credential/shift/sponsorship ([d1520fa](https://github.com/cherryb16/career-ops/commit/d1520fa8d31ab19a95c895aa27c2c5daa564ce5e))
+* **evaluation:** enforce hard-block score caps for seniority/credential/shift/sponsorship ([8b677d0](https://github.com/cherryb16/career-ops/commit/8b677d0c25bf4057c21e4f785c85ef14beae1989))
+
 ## [1.23.0](https://github.com/cherryb16/career-ops/compare/career-ops-v1.22.0...career-ops-v1.23.0) (2026-08-27)
 
 
