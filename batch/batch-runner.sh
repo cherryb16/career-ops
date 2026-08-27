@@ -18,6 +18,23 @@ PROFILE_FILE="$PROJECT_DIR/config/profile.yml"
 LOGS_DIR="$BATCH_DIR/logs"
 DISCARD_LOG="$LOGS_DIR/discard.log"
 TRACKER_DIR="$BATCH_DIR/tracker-additions"
+
+# Resolve the hermes binary explicitly rather than relying on `hermes` being
+# first on PATH. Hermes ships its own venv (with PyYAML etc. installed) at
+# ~/.hermes/hermes-agent/venv/bin/hermes; the launcher script's
+# `#!/usr/bin/env python3` shebang means if the CALLER's PATH happens to put
+# a system/Homebrew python3 ahead of that venv (e.g. a shell that hasn't
+# sourced the venv), `hermes` on PATH resolves to a python3 that's missing
+# hermes_cli's deps (or, on macOS's stock Python 3.9, too old for the
+# `str | None` syntax hermes_cli uses) and every offer silently fails with a
+# traceback in its log. Prefer the venv binary when present; PATH is only a
+# fallback for installs that don't use this venv layout.
+HERMES_VENV_BIN="$HOME/.hermes/hermes-agent/venv/bin/hermes"
+if [[ -x "$HERMES_VENV_BIN" ]]; then
+  HERMES_BIN="$HERMES_VENV_BIN"
+else
+  HERMES_BIN="hermes"
+fi
 REPORTS_DIR="$PROJECT_DIR/reports"
 APPLICATIONS_FILE="$PROJECT_DIR/data/applications.md"
 LOCK_FILE="${BATCH_LOCK_FILE:-$BATCH_DIR/batch-runner.pid}"
@@ -39,8 +56,10 @@ MAX_RETRIES=2
 MIN_SCORE=0
 SKIP_PDF=false
 MODEL=""  # explicit override; otherwise resolved from config/profile.yml spend_tier
+PROVIDER=""  # explicit override for the hermes CLI's --provider flag; default: nous
 RESOLVED_MODEL=""
 RESOLVED_SPEND_TIER=""
+RESOLVED_HERMES_PROVIDER=""
 RATE_LIMIT_SLEEP=300
 BATCH_PAUSED=false
 STATUS_ONLY=false
@@ -74,7 +93,13 @@ Options:
   --rate-limit-sleep N Seconds to wait before retrying a rate-limited worker
                        (default: 300)
   --model NAME         Override the tier-resolved model (otherwise uses config/profile.yml
-                       spend_tier: economy/standard/premium; default standard)
+                       spend_tier: economy/standard/premium; default standard).
+                       For --cli hermes, this is the hermes/OpenRouter model id
+                       (default: poolside/laguna-xs-2.1:free).
+  --provider NAME      Override the hermes CLI's --provider flag (default: nous).
+                       Only used by --cli hermes; e.g. --provider openrouter
+                       --model z-ai/glm-5.2:free routes through OpenRouter instead
+                       of the nous pool.
   --status             Show batch progress and a per-job table, then exit
   --watch              Live-refresh progress until the run completes
   -h, --help           Show this help
@@ -98,6 +123,9 @@ Examples:
 
   # Process 2 at a time starting from ID 10
   ./batch-runner.sh --parallel 2 --start-from 10
+
+  # Run hermes through OpenRouter instead of the default nous pool
+  ./batch-runner.sh --cli hermes --provider openrouter --model z-ai/glm-5.2:free
 USAGE
 }
 
@@ -119,6 +147,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --model) MODEL="$2"; shift 2 ;;
+    --provider) PROVIDER="$2"; shift 2 ;;
     --cli) CLI="$2"; shift 2 ;;
     --status) STATUS_ONLY=true; shift ;;
     --watch) WATCH_MODE=true; shift ;;
@@ -233,8 +262,8 @@ check_prerequisites() {
   # Validate the selected CLI binary exists
   case "$CLI" in
     hermes)
-      if ! command -v hermes >/dev/null 2>&1; then
-        echo "ERROR: 'hermes' CLI not found in PATH. Install Hermes or use --cli claude."
+      if [[ ! -x "$HERMES_BIN" ]] && ! command -v "$HERMES_BIN" >/dev/null 2>&1; then
+        echo "ERROR: hermes CLI not found (tried '$HERMES_BIN'). Install Hermes or use --cli claude."
         exit 1
       fi
       ;;
@@ -860,7 +889,7 @@ process_offer() {
       # files appended) + the actual prompt. We embed both as the oneshot message.
       local payload
       payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
-      worker_args=(-z "$payload" --yolo --accept-hooks --provider nous --model poolside/laguna-xs-2.1:free)
+      worker_args=(-z "$payload" --yolo --accept-hooks --provider "$RESOLVED_HERMES_PROVIDER" --model "$RESOLVED_MODEL")
       # Ensure required toolsets are enabled (web search, file ops, terminal, browser, code)
       worker_args+=(-t web,file,terminal,browser,code_execution)
       ;;
@@ -922,7 +951,7 @@ process_offer() {
     exit_code=0
     case "$CLI" in
       hermes)
-        hermes "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        "$HERMES_BIN" "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
       agy|agy-google|agy-other)
         agy "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
@@ -1228,10 +1257,21 @@ main() {
 
   resolve_worker_model
 
-  # For Hermes, we use explicit provider and model from worker_args
+  # For Hermes, default to the nous pool's free poolside model unless the
+  # caller explicitly overrode --model and/or --provider (e.g. to route
+  # through OpenRouter: --provider openrouter --model z-ai/glm-5.2:free).
+  # RESOLVED_SPEND_TIER is cosmetic here (shown in the run banner) and just
+  # mirrors whichever provider ends up in effect.
   if [[ "$CLI" == "hermes" ]]; then
-    RESOLVED_MODEL="poolside/laguna-xs-2.1:free"
-    RESOLVED_SPEND_TIER="nous"
+    if [[ -z "$MODEL" ]]; then
+      RESOLVED_MODEL="poolside/laguna-xs-2.1:free"
+    fi
+    if [[ -n "$PROVIDER" ]]; then
+      RESOLVED_HERMES_PROVIDER="$PROVIDER"
+    else
+      RESOLVED_HERMES_PROVIDER="nous"
+    fi
+    RESOLVED_SPEND_TIER="$RESOLVED_HERMES_PROVIDER"
   fi
 
   if [[ "$DRY_RUN" == "false" ]]; then
