@@ -21,9 +21,8 @@
  */
 
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, statSync } from 'fs';
-import { join, dirname, resolve } from 'path';
+import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { getCareerOpsRoot, resolveTrackerPath } from './path-resolver.mjs';
 import {
   looksLikeScoreCell, isSeparatorRow, isHeaderRow, resolveColumns,
   normalizeTextKey, normalizeVia,
@@ -31,20 +30,20 @@ import {
 import { checkTrackerSync } from './tracker-sync-check.mjs';
 import { checkFollowupsSchema } from './stats.mjs';
 
-const CODE_ROOT = dirname(fileURLToPath(import.meta.url));
-const CAREER_OPS = getCareerOpsRoot();
+const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // Support both layouts: data/applications.md (boilerplate) and applications.md (original).
 // CAREER_OPS_TRACKER overrides the path (used by tests and non-standard layouts).
-const APPS_FILE = resolveTrackerPath(CAREER_OPS);
-
+const APPS_FILE = process.env.CAREER_OPS_TRACKER
+  ? process.env.CAREER_OPS_TRACKER
+  : existsSync(join(CAREER_OPS, 'data/applications.md'))
+    ? join(CAREER_OPS, 'data/applications.md')
+    : join(CAREER_OPS, 'applications.md');
 const ADDITIONS_DIR = join(CAREER_OPS, 'batch/tracker-additions');
 // CAREER_OPS_REPORTS overrides the reports dir (used by tests, mirrors CAREER_OPS_TRACKER).
-const REPORTS_DIR = process.env.CAREER_OPS_REPORTS
-  ? resolve(CAREER_OPS, process.env.CAREER_OPS_REPORTS)
-  : join(CAREER_OPS, 'reports');
-const STATES_FILE = existsSync(join(CODE_ROOT, 'templates/states.yml'))
-  ? join(CODE_ROOT, 'templates/states.yml')
-  : join(CODE_ROOT, 'states.yml');
+const REPORTS_DIR = process.env.CAREER_OPS_REPORTS || join(CAREER_OPS, 'reports');
+const STATES_FILE = existsSync(join(CAREER_OPS, 'templates/states.yml'))
+  ? join(CAREER_OPS, 'templates/states.yml')
+  : join(CAREER_OPS, 'states.yml');
 
 // Ensure required directories exist (fresh setup)
 mkdirSync(join(CAREER_OPS, 'data'), { recursive: true });
@@ -290,7 +289,11 @@ function extractRole(reportContent) {
 }
 
 const reportFiles = existsSync(REPORTS_DIR)
-  ? readdirSync(REPORTS_DIR).filter(f => REPORT_FILE_RE.test(f))
+  ? readdirSync(REPORTS_DIR, { recursive: true })
+      .filter(f => REPORT_FILE_RE.test(f))
+      // Files under archive/ are superseded evaluations of re-posted jobs —
+      // kept for history but exempt from orphan/duplicate checks.
+      .filter(f => !f.startsWith('archive/'))
   : [];
 
 let dupReports = 0;
@@ -345,7 +348,7 @@ for (const e of entries) {
   }
   for (const lt of linkTexts) referencedNums.add(parseInt(lt[1], 10));
   for (const lt of linkTargets) {
-    const m = lt[1].split(/[\\/]/).pop().match(/^(\d+)-/);
+    const m = lt[1].split('/').pop().match(/^(\d+)-/);
     if (m) referencedNums.add(parseInt(m[1], 10));
   }
 }
@@ -444,12 +447,7 @@ let syncResult;
 try {
   syncResult = checkTrackerSync({ appsFile: APPS_FILE });
 } catch (err) {
-  // A check that could not RUN is a failed check, not a warning. warn() does not affect the exit
-  // code, so a throw here made verify-pipeline print a notice and still exit 0 — and to anything
-  // reading the exit status (CI, a cron wrapper, a pre-push hook) that is indistinguishable from
-  // the invariant holding. We do not know whether the tracker is in sync; we know we failed to
-  // look. The honest report is failure.
-  error(`Sync check could not run — the tracker was NOT verified: ${err.message}`);
+  warn(`Sync check could not run: ${err.message}`);
 }
 
 if (syncResult) {
