@@ -91,31 +91,6 @@ The evaluation scores five dimensions, integrated into one global score of 1-5. 
 - 3.5-3.9 → Decent but not ideal, apply only if specific reason
 - Below 3.5 → Recommend against applying (see Ethical Use in AGENTS.md)
 
-### Hard-block score caps (MANDATORY — apply BEFORE the holistic judgment)
-
-Certain requirements are **hard blockers**, not dimensions. When one is triggered, the global score is **capped**, no matter how strong the archetype/comp/culture match is. These caps are not negotiable and cannot be "averaged up" by other dimensions.
-
-| Hard blocker | Def | Cap | Disposition |
-|---|---|---|---|
-| **Seniority / experience hard-stop** | JD requires ≥3 years of professional (non-internship) experience AND the candidate has <1 year (per `cv.md` / `config/profile.yml` `experience_level`). A 5+ year requirement is a definitive hard-stop. | **≤ 2.0** | **SKIP** |
-| **Credential gate** | JD requires a degree/license the candidate lacks AND cannot obtain before start (e.g. JD/bar for legal, active TS/SCI clearance, CPA, graduate degree for an undergrad-only role, security clearance the candidate does not hold). | **≤ 1.5** | **SKIP** |
-| **Shift-pattern violation** | Night / weekend / rotating shifts (per `config/profile.yml` `schedule_constraints`). | **≤ 2.0** | **SKIP** |
-| **No-sponsorship + out-of-country** | JD explicitly declines sponsorship AND role is outside `location.authorized_in` (see `oferta.md` work-authorization check). | **≤ 2.0** | **SKIP** |
-
-Rules for the seniority hard-stop specifically (the most frequent mis-score):
-- Read the JD's stated experience requirement **literally**. "6+ years", "8-10 years", "3+ years professional" — if the number is ≥3 and the candidate is a current student with internship-only experience, the seniority hard-stop fires.
-- A strong archetype match (Block B) or a high comp band (Block D) must NOT compensate. The cap applies to the *global* score regardless of individual dimension scores.
-- The report MUST state the hard-stop verbatim in the notes (e.g. "Seniority hard-stop: JD requires 6+ yrs, candidate has internship-level only → score capped ≤2.0") and set `recommendation: SKIP`.
-- Titles containing "Lead", "Manager III", "Senior", "Staff", "Principal", "Experienced" are a *signal to check* the requirement — they do not by themselves trigger the cap, but they mean the evaluation must read the experience line before scoring a 4+.
-
-### Relocation is NOT a blocker or a penalty (MANDATORY)
-
-The candidate is **open to relocation** for full-time post-graduation roles (per `config/profile.yml` `compensation.location_flexibility` and `modes/_profile.md` "Your Location Policy"). A different city/state is `neutral`, never a score-down or a concern, for any **post-graduate full-time** role.
-
-- **Never** write "relocation to {location} required" as a concern, risk, or reason to SKIP/WATCH.
-- **Never** reduce the geographic/location dimension score because the role is in a non-Provo/SLC city for a full-time role.
-- The only location penalties that remain valid are: (a) hard shift-pattern violations (already a blocker), (b) role located OUTSIDE the candidate's authorized countries (the work-authorization check), and (c) **internship** roles that require on-site outside Provo/SLC (internships stay remote/Provo/SLC-preferred — see `_profile.md`).
-
 **How to score the "Cultural signals" dimension:**
 1. Read `culture_screen.require` from `config/profile.yml`. If `culture_screen` is missing or empty, skip the structural capping and score the dimension qualitatively based on company size, remote policy, and stability.
 2. Actively look for evidence in the JD + Block G company research corresponding to those requirements (e.g., team size mentions, org-chart depth/manager layers, meeting-culture language, company stage).
@@ -128,6 +103,8 @@ The candidate is **open to relocation** for full-time post-graduation roles (per
 ## Posting Legitimacy (Block G)
 
 Block G assesses whether a posting is likely a real, active opening. It does NOT affect the 1-5 global score -- it is a separate qualitative assessment.
+
+The same holds for Block B's **requirement Importance column**: it does NOT affect the 1-5 global score either -- it is a prioritization and interview-preparation surface. The CV-match dimension stays a holistic judgment, so reports written before and after that column remain comparable, and the 4.0 apply / don't-apply line keeps its meaning across the whole history folded by `analyze-patterns.mjs`, `stats.mjs`, `funnel-velocity.mjs` and `rank-pipeline.mjs`.
 
 **Three tiers:**
 - **High Confidence** -- Real, active opening (most signals positive)
@@ -227,7 +204,7 @@ After detecting archetype, read `modes/_profile.md` for the user's specific fram
 7. Be direct and actionable -- no fluff
 8. Native tech English for generated text. Short sentences, action verbs, no passive voice.
 8b. Case study URLs in PDF Professional Summary (recruiter may only read this).
-9. **Tracker additions as TSV** -- NEVER edit applications.md directly. Write TSV in `batch/tracker-additions/`.
+9. **Tracker additions as TSV** -- NEVER edit applications.md directly. Write TSV in `batch/tracker-additions/`: a header row of column labels, then one data row (see AGENTS.md, "TSV Format for Tracker Additions"). The header is what lets `merge-tracker.mjs` resolve fields by name instead of guessing which column is score and which is status.
 10. **Include `**URL:**` in every report header.**
 
 ### Tools

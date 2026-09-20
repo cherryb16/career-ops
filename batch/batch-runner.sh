@@ -1,53 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# career-ops batch runner — standalone orchestrator for claude -p workers
-# Reads batch-input.tsv, delegates each offer to a claude -p worker,
-# tracks state in batch-state.tsv for resumability.
+# career-ops batch runner — standalone orchestrator for headless agent workers
+# Reads batch-input.tsv, delegates each offer to a worker, tracks state in
+# batch-state.tsv for resumability.
 #
-# NOTE: This script supports multiple CLIs. Claude uses --permission-mode auto,
-# AGY uses --dangerously-skip-permissions, Hermes uses --yolo.
+# Supported CLIs (--cli flag):
+#   claude    — claude -p with --dangerously-skip-permissions (default)
+#   opencode  — opencode run (falls back to ollama launch opencode if not in PATH)
+#   gemini    — gemini -p
+#   qwen      — qwen -p
+#
+# Only claude supports --strict-mcp-config, the rate-limit/session retry loop,
+# and --parallel > 1; other CLIs run sequentially with a single attempt.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BATCH_DIR="$SCRIPT_DIR"
-INPUT_FILE="${BATCH_INPUT_FILE:-$BATCH_DIR/batch-input.tsv}"
-STATE_FILE="${BATCH_STATE_FILE:-$BATCH_DIR/batch-state.tsv}"
+INPUT_FILE="$BATCH_DIR/batch-input.tsv"
+STATE_FILE="$BATCH_DIR/batch-state.tsv"
 PROMPT_FILE="$BATCH_DIR/batch-prompt.md"
 PROFILE_FILE="$PROJECT_DIR/config/profile.yml"
 LOGS_DIR="$BATCH_DIR/logs"
 DISCARD_LOG="$LOGS_DIR/discard.log"
 TRACKER_DIR="$BATCH_DIR/tracker-additions"
-
-# Resolve the hermes binary explicitly rather than relying on `hermes` being
-# first on PATH. Hermes ships its own venv (with PyYAML etc. installed) at
-# ~/.hermes/hermes-agent/venv/bin/hermes; the launcher script's
-# `#!/usr/bin/env python3` shebang means if the CALLER's PATH happens to put
-# a system/Homebrew python3 ahead of that venv (e.g. a shell that hasn't
-# sourced the venv), `hermes` on PATH resolves to a python3 that's missing
-# hermes_cli's deps (or, on macOS's stock Python 3.9, too old for the
-# `str | None` syntax hermes_cli uses) and every offer silently fails with a
-# traceback in its log. Prefer the venv binary when present; PATH is only a
-# fallback for installs that don't use this venv layout.
-HERMES_VENV_BIN="$HOME/.hermes/hermes-agent/venv/bin/hermes"
-if [[ -x "$HERMES_VENV_BIN" ]]; then
-  HERMES_BIN="$HERMES_VENV_BIN"
-else
-  HERMES_BIN="hermes"
-fi
 REPORTS_DIR="$PROJECT_DIR/reports"
 APPLICATIONS_FILE="$PROJECT_DIR/data/applications.md"
-LOCK_FILE="${BATCH_LOCK_FILE:-$BATCH_DIR/batch-runner.pid}"
+LOCK_FILE="$BATCH_DIR/batch-runner.pid"
 PAUSE_FILE="$BATCH_DIR/batch-runner.paused"
 STATE_LOCK_DIR="$BATCH_DIR/.batch-state.lock"
 STATE_LOCK_PID_FILE="$STATE_LOCK_DIR/pid"
-RECOVERY_DIR="$BATCH_DIR/batch-state-recovery.d"
 STATE_LOCK_TIMEOUT_SECONDS=30
 MAIN_PID="${BASHPID:-$$}"
 
 # Defaults
 PARALLEL=1
-CLI="agy"
 DRY_RUN=false
 RETRY_FAILED=false
 RESUME_PAUSED=false
@@ -56,10 +43,9 @@ MAX_RETRIES=2
 MIN_SCORE=0
 SKIP_PDF=false
 MODEL=""  # explicit override; otherwise resolved from config/profile.yml spend_tier
-PROVIDER=""  # explicit override for the hermes CLI's --provider flag; default: nous
 RESOLVED_MODEL=""
 RESOLVED_SPEND_TIER=""
-RESOLVED_HERMES_PROVIDER=""
+CLI=claude
 RATE_LIMIT_SLEEP=300
 BATCH_PAUSED=false
 STATUS_ONLY=false
@@ -73,33 +59,29 @@ is_decimal_number() {
 
 usage() {
   cat <<'USAGE'
-career-ops batch runner — process job offers in batch via headless workers (default: hermes)
-Uses spend_tier from config/profile.yml unless --model overrides it.
+career-ops batch runner — process job offers in batch via headless agent workers
+Defaults to claude; other CLIs via --cli. For claude the model is resolved from
+spend_tier in config/profile.yml unless --model overrides it.
 
 Usage: batch-runner.sh [OPTIONS]
 
 Options:
-  --cli NAME           Worker CLI: agy (Gemini pool), agy-google (same as agy),
-                       agy-other (Claude pool), claude, codex, or hermes (default: agy)
-  --parallel N         Number of parallel workers (default: 1)
+  --cli NAME           Agent CLI to use: claude (default), opencode, gemini, qwen
+  --model NAME         Model for the CLI (e.g. qwen2.5:32b for opencode/ollama).
+                       For claude, overrides the tier-resolved model (otherwise
+                       config/profile.yml spend_tier: economy/standard/premium;
+                       default standard).
+  --parallel N         Number of parallel workers (default: 1; claude only)
   --dry-run            Show what would be processed, don't execute
   --retry-failed       Only retry offers marked as "failed" in state
-  --resume-paused      Resume offers paused by a session/rate limit
+  --resume-paused      Resume offers paused by a Claude session/rate limit
   --start-from N       Start from offer ID N (skip earlier IDs)
   --limit N            Max number of offers to process in this run
   --max-retries N      Max retry attempts per offer (default: 2)
   --min-score N        Skip PDF/tracker for offers scoring below N (default: 0 = off)
   --skip-pdf           Skip PDF generation entirely (write ❌ in tracker PDF column)
   --rate-limit-sleep N Seconds to wait before retrying a rate-limited worker
-                       (default: 300)
-  --model NAME         Override the tier-resolved model (otherwise uses config/profile.yml
-                       spend_tier: economy/standard/premium; default standard).
-                       For --cli hermes, this is the hermes/OpenRouter model id
-                       (default: poolside/laguna-xs-2.1:free).
-  --provider NAME      Override the hermes CLI's --provider flag (default: nous).
-                       Only used by --cli hermes; e.g. --provider openrouter
-                       --model z-ai/glm-5.2:free routes through OpenRouter instead
-                       of the nous pool.
+                       (default: 300; claude only)
   --status             Show batch progress and a per-job table, then exit
   --watch              Live-refresh progress until the run completes
   -h, --help           Show this help
@@ -121,17 +103,18 @@ Examples:
   # Retry only failed offers
   ./batch-runner.sh --retry-failed
 
-  # Process 2 at a time starting from ID 10
+  # Process 2 at a time starting from ID 10 (claude only)
   ./batch-runner.sh --parallel 2 --start-from 10
 
-  # Run hermes through OpenRouter instead of the default nous pool
-  ./batch-runner.sh --cli hermes --provider openrouter --model z-ai/glm-5.2:free
+  # Local LLM via OpenCode (free, runs sequentially)
+  ./batch-runner.sh --cli opencode --model qwen2.5:32b
 USAGE
 }
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --cli) CLI="$2"; shift 2 ;;
     --parallel) PARALLEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --retry-failed) RETRY_FAILED=true; shift ;;
@@ -147,8 +130,6 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --model) MODEL="$2"; shift 2 ;;
-    --provider) PROVIDER="$2"; shift 2 ;;
-    --cli) CLI="$2"; shift 2 ;;
     --status) STATUS_ONLY=true; shift ;;
     --watch) WATCH_MODE=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -197,56 +178,6 @@ release_lock() {
 
 trap release_lock EXIT
 
-# Resolve Claude Code auth for headless workers.
-# Interactive `claude auth login` state does not apply to `claude -p` workers in
-# all contexts; the supported path is the CLAUDE_CODE_OAUTH_TOKEN env var
-# (produced by `claude setup-token`). On this machine that token lives in
-# Bitwarden Secrets Manager as CLAUDE_CODE_OAUTH_TOKEN, so if the env var is not
-# already exported we fetch it with `bws` (never printed, never written to disk).
-ensure_claude_auth() {
-  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-    return 0
-  fi
-
-  local bws_bin secret_id
-  bws_bin="$(command -v bws || true)"
-  if [[ -z "$bws_bin" ]]; then
-    echo "WARN: CLAUDE_CODE_OAUTH_TOKEN not set and 'bws' (Bitwarden Secrets Manager) not found."
-    echo "      Falling back to whatever auth the claude CLI already has. If workers fail"
-    echo "      with auth errors, run 'claude setup-token' and export CLAUDE_CODE_OAUTH_TOKEN,"
-    echo "      or store the token in Bitwarden as secret CLAUDE_CODE_OAUTH_TOKEN."
-    return 0
-  fi
-
-  # Allow override via env in case the secret id changes.
-  secret_id="${BWS_CLAUDE_TOKEN_SECRET_ID:-80ca912d-f62a-4bd7-b8f6-b4b101305c35}"
-  local fetched=""
-  fetched="$("$bws_bin" secret get "$secret_id" --output json 2>/dev/null \
-    | python3 -c "import json,sys; print(json.load(sys.stdin).get('value',''))" 2>/dev/null || true)"
-  if [[ -n "$fetched" ]]; then
-    export CLAUDE_CODE_OAUTH_TOKEN="$fetched"
-    echo "INFO: CLAUDE_CODE_OAUTH_TOKEN resolved from Bitwarden Secrets Manager."
-  else
-    echo "WARN: Could not fetch CLAUDE_CODE_OAUTH_TOKEN from Bitwarden (secret $secret_id)."
-    echo "      Falling back to existing claude CLI auth."
-  fi
-}
-
-# Verify Codex CLI headless auth. Codex uses ChatGPT OAuth stored in
-# ~/.codex/auth.json — there is no token env var, so we can only probe.
-ensure_codex_auth() {
-  if codex login status >/dev/null 2>&1; then
-    return 0
-  fi
-  # login status exits nonzero when logged out; check output to be sure.
-  if codex login status 2>&1 | grep -qi "logged in"; then
-    return 0
-  fi
-  echo "ERROR: Codex CLI is not logged in. Run 'codex login' interactively first"
-  echo "       (browser OAuth), or use --cli agy / --cli claude."
-  exit 1
-}
-
 # Validate prerequisites
 check_prerequisites() {
   if [[ ! -f "$INPUT_FILE" ]]; then
@@ -259,39 +190,31 @@ check_prerequisites() {
     exit 1
   fi
 
-  # Validate the selected CLI binary exists
+  # Resolve the binary the configured CLI actually needs. opencode can run
+  # natively or fall back to ollama, so check for either.
+  local cli_cmd
   case "$CLI" in
-    hermes)
-      if [[ ! -x "$HERMES_BIN" ]] && ! command -v "$HERMES_BIN" >/dev/null 2>&1; then
-        echo "ERROR: hermes CLI not found (tried '$HERMES_BIN'). Install Hermes or use --cli claude."
-        exit 1
-      fi
-      ;;
-    agy|agy-google|agy-other)
-      if ! command -v agy >/dev/null 2>&1; then
-        echo "ERROR: 'agy' CLI not found in PATH. Install Antigravity CLI or use --cli claude."
-        exit 1
-      fi
-      ;;
-    claude)
-      if ! command -v claude >/dev/null 2>&1; then
-        echo "ERROR: 'claude' CLI not found in PATH. Install Claude Code or use --cli agy."
-        exit 1
-      fi
-      ensure_claude_auth
-      ;;
-    codex)
-      if ! command -v codex >/dev/null 2>&1; then
-        echo "ERROR: 'codex' CLI not found in PATH. Install Codex CLI or use --cli agy."
-        exit 1
-      fi
-      ensure_codex_auth
-      ;;
-    *)
-      echo "ERROR: Unsupported --cli '$CLI'. Supported: agy, agy-google, agy-other, claude, codex, hermes"
-      exit 1
-      ;;
+    claude)   cli_cmd="claude" ;;
+    opencode) command -v opencode &>/dev/null && cli_cmd="opencode" || cli_cmd="ollama" ;;
+    gemini)   cli_cmd="gemini" ;;
+    qwen)     cli_cmd="qwen" ;;
+    *) echo "ERROR: Unknown --cli '$CLI'. Supported: claude, opencode, gemini, qwen"; exit 1 ;;
   esac
+
+  if ! command -v "$cli_cmd" &>/dev/null; then
+    echo "ERROR: '$cli_cmd' not found in PATH (required for --cli $CLI)."
+    if [[ "$CLI" == "opencode" ]]; then
+      echo "       Install opencode (https://opencode.ai) or Ollama (https://ollama.ai) with an opencode model."
+    fi
+    exit 1
+  fi
+
+  # Parallelism, the rate-limit retry loop, and --strict-mcp-config are
+  # claude-only; local models run one at a time.
+  if [[ "$CLI" != "claude" && "$PARALLEL" -gt 1 ]]; then
+    echo "WARN: --parallel >1 is not supported for --cli $CLI (local models run sequentially). Resetting to 1."
+    PARALLEL=1
+  fi
 
   mkdir -p "$LOGS_DIR" "$TRACKER_DIR" "$REPORTS_DIR"
 }
@@ -311,6 +234,13 @@ init_state() {
   fi
 }
 
+# A lock held longer than this is assumed abandoned, independent of the
+# PID-liveness check below. This exists because `kill -0 $pid` is unreliable
+# on Git Bash/Windows (MSYS PIDs from $!/$BASHPID don't reliably map to real
+# Windows process IDs), so a genuinely-dead lock holder can otherwise never
+# be recovered there and every other worker times out waiting for it.
+STATE_LOCK_STALE_AGE_SECONDS=15
+
 acquire_state_lock() {
   if [[ "${STATE_LOCK_DISABLED:-0}" -eq 1 ]]; then
     return 0
@@ -321,13 +251,13 @@ acquire_state_lock() {
 
   while true; do
     if mkdir "$STATE_LOCK_DIR" 2>/dev/null; then
-      if printf '%s\n' "${BASHPID:-$$}" > "$STATE_LOCK_PID_FILE"; then
+      if printf '%s\t%s\n' "${BASHPID:-$$}" "$(date +%s)" > "$STATE_LOCK_PID_FILE"; then
         STATE_LOCK_OWNED=1
         return 0
       fi
       rm -f "$STATE_LOCK_PID_FILE" 2>/dev/null || true
       rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
-      echo "ERROR: Failed to initialize state lock metadata at $STATE_LOCK_DIR"
+      echo "ERROR: Failed to initialize state lock metadata at $STATE_LOCK_DIR" >&2
       return 1
     fi
 
@@ -338,25 +268,64 @@ acquire_state_lock() {
         STATE_LOCK_OWNED=0
         return 0
       fi
-      echo "ERROR: Failed to create state lock directory $STATE_LOCK_DIR"
+      echo "ERROR: Failed to create state lock directory $STATE_LOCK_DIR" >&2
       return 1
     fi
 
     if [[ -f "$STATE_LOCK_PID_FILE" ]]; then
-      local lock_pid
-      lock_pid=$(cat "$STATE_LOCK_PID_FILE" 2>/dev/null || true)
-      if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      local lock_pid lock_epoch
+      lock_pid=$(cut -f1 "$STATE_LOCK_PID_FILE" 2>/dev/null || true)
+      lock_epoch=$(cut -f2 "$STATE_LOCK_PID_FILE" 2>/dev/null || true)
+      local stale=false
+      local stale_reason=""
+
+      # SAFETY INVARIANT: never treat the lock as stale while kill -0
+      # positively confirms the recorded PID is still running — a
+      # confirmed-alive owner may still write update_state_unlocked's
+      # rewrite of STATE_FILE, and reclaiming under it would let two
+      # processes rewrite $STATE_FILE.tmp concurrently (real data loss).
+      # The age-based fallback below only ever fires when the PID check
+      # could NOT confirm liveness (empty/missing PID, or kill -0 itself
+      # reported not-running) — it narrows, but does not replace, the PID
+      # check. This intentionally leaves one Windows/Git-Bash edge case
+      # unhandled: a `kill -0` FALSE POSITIVE (reports alive for a PID
+      # that Windows has actually reused for an unrelated process). That
+      # gap is accepted because the alternative — reclaiming while any
+      # chance remains the owner is genuinely alive — risks silent
+      # concurrent-write corruption, which is worse than this lock
+      # occasionally timing out (recoverable via retry) in that rare case.
+      local pid_confirmed_alive=false
+      if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+        pid_confirmed_alive=true
+      fi
+
+      if [[ "$pid_confirmed_alive" == "false" ]]; then
+        if [[ -n "$lock_pid" ]]; then
+          stale=true
+          stale_reason="PID $lock_pid not running"
+        elif [[ "$lock_epoch" =~ ^[0-9]+$ ]]; then
+          local now age
+          now=$(date +%s)
+          age=$((now - lock_epoch))
+          if (( age >= STATE_LOCK_STALE_AGE_SECONDS )); then
+            stale=true
+            stale_reason="lock age ${age}s >= ${STATE_LOCK_STALE_AGE_SECONDS}s (no PID recorded to check liveness against)"
+          fi
+        fi
+      fi
+
+      if [[ "$stale" == "true" ]]; then
         rm -f "$STATE_LOCK_PID_FILE"
         if rmdir "$STATE_LOCK_DIR" 2>/dev/null; then
-          echo "WARN: Recovered stale state lock (PID $lock_pid not running)."
+          echo "WARN: Recovered stale state lock ($stale_reason)." >&2
           continue
         fi
       fi
     fi
 
     if (( waited >= max_waits )); then
-      echo "ERROR: Timed out waiting for state lock at $STATE_LOCK_DIR"
-      echo "If no batch-runner worker is active, remove the stale lock directory."
+      echo "ERROR: Timed out waiting for state lock at $STATE_LOCK_DIR" >&2
+      echo "If no batch-runner worker is active, remove the stale lock directory." >&2
       return 1
     fi
 
@@ -452,36 +421,28 @@ read_spend_tier() {
   esac
 }
 
-# Tier -> model mapping for the Claude CLI. Uses stable family aliases
-# ('haiku'/'sonnet'/'opus') so each tier always tracks the latest model in
-# that family without a script change. Keep in sync with modes/_shared.md.
+# Tier -> model mapping. Keep in sync with the table in modes/_shared.md.
 spend_tier_to_model() {
   case "$1" in
-    economy) echo "haiku" ;;
-    premium) echo "opus" ;;
-    standard|*) echo "sonnet" ;;
+    economy) echo "claude-haiku-4-5" ;;
+    premium) echo "claude-opus-5" ;;
+    standard|*) echo "claude-sonnet-5" ;;
   esac
 }
 
-# Map a Claude CLI model alias (haiku/sonnet/opus from spend_tier_to_model)
-# to the Codex CLI's -m values. Codex is GPT-family only, so every tier maps
-# to the closest GPT tier; --model with an explicit codex id always wins.
-# Defaults follow this install's ~/.codex/config.toml (gpt-5.6-luna) — ChatGPT
-# accounts reject ids like 'gpt-5.1-codex', so verify with a one-shot before
-# changing these.
-codex_model_alias() {
-  case "$1" in
-    haiku) echo "gpt-5.6-luna" ;;
-    opus) echo "gpt-5.6-sol" ;;
-    sonnet|*) echo "gpt-5.6-luna" ;;
-  esac
-}
-
-# Resolve the model to pass to `claude -p --model`. --model always wins.
+# Resolve the model to pass to the worker CLI. --model always wins.
+# spend_tier maps to Claude model names, so it only applies to --cli claude;
+# other CLIs use --model verbatim, or their own default when it is unset.
 resolve_worker_model() {
   if [[ -n "$MODEL" ]]; then
     RESOLVED_MODEL="$MODEL"
     RESOLVED_SPEND_TIER="override"
+    return 0
+  fi
+
+  if [[ "$CLI" != "claude" ]]; then
+    RESOLVED_MODEL=""
+    RESOLVED_SPEND_TIER="cli-default"
     return 0
   fi
 
@@ -500,39 +461,21 @@ log_discard() {
   printf '%s\t%s\t%s\t%s\n' "$ts" "$id" "$url" "$reason" >> "$DISCARD_LOG"
 }
 
-# Calculate next report number.
-# Caller must hold STATE_LOCK_DIR while this runs.
-next_report_num_unlocked() {
-  local max_num=0
-  if [[ -d "$REPORTS_DIR" ]]; then
-    for f in "$REPORTS_DIR"/*.md; do
-      [[ -f "$f" ]] || continue
-      local basename
-      basename=$(basename "$f")
-      local num="${basename%%-*}"
-      num=$((10#$num)) # Remove leading zeros for arithmetic
-      if (( num > max_num )); then
-        max_num=$num
-      fi
-    done
-  fi
-  # Also check state file for assigned report numbers
-  if [[ -f "$STATE_FILE" ]]; then
-    while IFS=$'\t' read -r _ _ _ _ _ rnum _ _ _; do
-      [[ "$rnum" == "report_num" || "$rnum" == "-" || -z "$rnum" ]] && continue
-      local n=$((10#$rnum))
-      if (( n > max_num )); then
-        max_num=$n
-      fi
-    done < "$STATE_FILE"
-  fi
-  printf '%03d' $((max_num + 1))
-}
 
 # Update or insert state for an offer.
 # Caller must hold STATE_LOCK_DIR while this runs.
 update_state_unlocked() {
   local id="$1" url="$2" status="$3" started="$4" completed="$5" report_num="$6" score="$7" error="$8" retries="$9"
+
+  # batch-state.tsv is tab-separated with one row per line -- a literal tab,
+  # newline, or carriage return inside $error (e.g. from a worker's raw error
+  # text, or JSON.parse unescaping \n/\r/\t in a caller upstream) would split
+  # into extra columns or extra rows and corrupt every row after it. Collapse
+  # them to spaces centrally here so every caller is protected, not just the
+  # one that happened to trigger this.
+  error=${error//$'\r'/ }
+  error=${error//$'\n'/ }
+  error=${error//$'\t'/ }
 
   if [[ ! -f "$STATE_FILE" ]]; then
     init_state
@@ -569,6 +512,23 @@ update_state() {
   run_with_state_lock update_state_unlocked "$@"
 }
 
+# Durable last-resort records of state transitions that could NOT be written
+# into $STATE_FILE (state-lock exhausted its retries). ONE FILE PER RECORD:
+# each failed transition gets its own uniquely-named file via mktemp
+# (O_CREAT|O_EXCL — atomic creation, guaranteed-unique name), so no two
+# workers ever write to the same file and no shared-file truncate/append
+# race can exist on any platform. That matters here because recovery writes
+# are CORRELATED, not independent: they fire exactly when the state lock is
+# jammed, which makes all parallel workers fail (and try to record) at the
+# same moment — a shared recovery file is racing precisely when it is
+# needed most (PR #2417 review). This mechanism must also never depend on
+# the state lock that just failed, and it doesn't: creation is the only
+# synchronization. reconcile_recovery_records() (start of the next run,
+# single-threaded, before any worker spawns) merges each record into
+# $STATE_FILE and deletes its file only on success — there is no
+# rewrite-and-rename step, so nothing here needs cross-filesystem atomicity.
+RECOVERY_DIR="$BATCH_DIR/batch-state-recovery.d"
+
 append_recovery_record() {
   local id="$1" url="$2" status="$3" started="$4" completed="$5" report_num="$6" score="$7" error="$8" retries="$9"
   # Same rationale as update_state_unlocked: a literal tab/newline/CR in
@@ -601,7 +561,6 @@ append_recovery_record() {
 # Terminal set mirrors the pending-selection guard in main() exactly. Keep
 # the two in sync: adding a terminal status there without adding it here
 # reopens this rollback for that status.
-
 recovery_record_is_superseded() {
   local current="$1"
   [[ "$current" == "completed" || "$current" == "skipped" ]]
@@ -617,7 +576,6 @@ recovery_record_is_superseded() {
 # Exit codes: 0 merged · 3 superseded (record is stale, caller should drop
 # it) · anything else is a real failure. 3 avoids colliding with the 1 that
 # acquire_state_lock returns when the lock itself is unreachable.
-
 reconcile_one_unlocked() {
   local id="$1"
   local current
@@ -629,7 +587,6 @@ reconcile_one_unlocked() {
   update_state_unlocked "$@"
 }
 
-
 reconcile_one() {
   run_with_state_lock reconcile_one_unlocked "$@"
 }
@@ -640,7 +597,6 @@ reconcile_one() {
 # are guaranteed a clean shot at the lock. Each record file is deleted only
 # after its transition lands in $STATE_FILE (or is found to be superseded);
 # genuine failures leave the file in place for the run after that.
-
 reconcile_recovery_records() {
   [[ -d "$RECOVERY_DIR" ]] || return 0
 
@@ -708,7 +664,6 @@ reconcile_recovery_records() {
 # CALLER can still decide whether to skip side effects that assumed success
 # (found under --parallel 5 on Git Bash/Windows: ~47 of 50 jobs silently
 # dropped in one run from exactly this before the retry+recovery-log fix).
-
 update_state_retrying() {
   local attempt=0
   local max_attempts=3
@@ -730,14 +685,65 @@ update_state_retrying() {
   return 1
 }
 
+is_rate_limit_log() {
+  local log_file="$1"
+  grep -Eiq '(rate limit|rate_limit|too many requests|429|quota exceeded|try again later|temporarily unavailable)' "$log_file"
+}
 
+is_session_limit_log() {
+  local log_file="$1"
+  grep -Eiq '(session limit|resets [0-9:]+[ap]m|usage limit|limit[[:space:]]+reached)' "$log_file"
+}
+
+mark_paused_rate_limit() {
+  local id="$1" url="$2" started_at="$3" report_num="$4" retries="$5" log_file="$6"
+  local completed_at
+  completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local error_msg
+  error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "session/rate limit reached")
+  update_state_retrying "$id" "$url" "paused_rate_limit" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries" || true
+  printf '%s\t%s\t%s\n' "$id" "$report_num" "$error_msg" > "$PAUSE_FILE"
+  BATCH_PAUSED=true
+}
+
+reserve_report_num_unlocked() {
+  local id="$1" url="$2" started="$3" retries="$4"
+
+  # Use the shared, cross-process-atomic reservation system (O_CREAT|O_EXCL
+  # sentinel files in reserve-report-num.mjs) instead of the old bash-native
+  # max(existing report files, batch-state.tsv numbers)+1 scan. The bash-native
+  # version had zero visibility into reservations made by any OTHER process
+  # calling `node reserve-report-num.mjs` directly -- e.g. an interactively
+  # dispatched Agent evaluating one offer with a browser tool while a batch
+  # run is in flight. Both could independently compute the same "next" number
+  # and collide on disk. Found 2026-07-30: two separate collisions (report
+  # 049, report 051) in one batch run for exactly this reason -- routing every
+  # caller through the same node script means they all share one real lock.
+  local report_num=""
+  report_num=$(node "$PROJECT_DIR/reserve-report-num.mjs" 2>/dev/null | tr -d '[:space:]')
+  if [[ -n "$report_num" ]]; then
+    update_state_unlocked "$id" "$url" "processing" "$started" "-" "$report_num" "-" "-" "$retries"
+  fi
+
+  printf '%s\n' "$report_num"
+}
+
+# Release a report-number reservation via the shared atomic system. Safe to
+# call even if the number was never actually reserved this way (e.g. a
+# resumed/paused offer) -- the underlying script no-ops on a missing sentinel.
 release_report_num() {
   local report_num="$1"
   [[ -n "$report_num" && "$report_num" != "-" ]] || return 0
   node "$PROJECT_DIR/reserve-report-num.mjs" --release "$report_num" >/dev/null 2>&1 || true
 }
 
+reserve_report_num() {
+  run_with_state_lock reserve_report_num_unlocked "$@"
+}
 
+# Retry wrapper — same rationale as update_state_retrying above. A bare
+# `x=$(reserve_report_num ...)` under `set -e` kills the worker subshell
+# silently on a single lock-timeout; this retries and logs instead.
 reserve_report_num_retrying() {
   local attempt=0
   local max_attempts=3
@@ -757,48 +763,6 @@ reserve_report_num_retrying() {
   return 1
 }
 
-is_rate_limit_log() {
-  local log_file="$1"
-  grep -Eiq '(rate limit|rate_limit|too many requests|429|quota exceeded|try again later|temporarily unavailable)' "$log_file"
-}
-
-is_session_limit_log() {
-  local log_file="$1"
-  # "Individual quota reached...Resets in Xh" is agy's Gemini/Claude usage-class
-  # exhaustion message — same shape as the other session-limit strings (a hard
-  # stop with its own reset clock), not a transient rate limit worth retrying
-  # within this run. Without "quota reached" here it fell through to
-  # is_rate_limit_log (which only matched "quota exceeded", different wording)
-  # and burned through MAX_RETRIES marking every remaining offer "failed".
-  grep -Eiq '(session limit|resets [0-9:]+[ap]m|usage limit|limit[[:space:]]+reached|quota[[:space:]]+reached)' "$log_file"
-}
-
-mark_paused_rate_limit() {
-  local id="$1" url="$2" started_at="$3" report_num="$4" retries="$5" log_file="$6"
-  local completed_at
-  completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  local error_msg
-  error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "session/rate limit reached")
-  update_state_retrying "$id" "$url" "paused_rate_limit" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries"
-  printf '%s\t%s\t%s\n' "$id" "$report_num" "$error_msg" > "$PAUSE_FILE"
-  BATCH_PAUSED=true
-}
-
-reserve_report_num_unlocked() {
-  local id="$1" url="$2" started="$3" retries="$4"
-
-  local report_num=""
-  if report_num=$(next_report_num_unlocked); then
-    update_state_unlocked "$id" "$url" "processing" "$started" "-" "$report_num" "-" "-" "$retries"
-  fi
-
-  printf '%s\n' "$report_num"
-}
-
-reserve_report_num() {
-  run_with_state_lock reserve_report_num_unlocked "$@"
-}
-
 # Process a single offer
 process_offer() {
   local id="$1" url="$2" source="$3" notes="$4"
@@ -808,7 +772,9 @@ process_offer() {
   local retries
   retries=$(get_retries "$id")
   local report_num
-  report_num=$(reserve_report_num "$id" "$url" "$started_at" "$retries")
+  if ! report_num=$(reserve_report_num_retrying "$id" "$url" "$started_at" "$retries"); then
+    return 1
+  fi
   local date
   date=$(date +%Y-%m-%d)
   # Use mktemp instead of a predictable /tmp path: a fixed name like
@@ -816,6 +782,128 @@ process_offer() {
   # could pre-create it as a symlink and redirect or clobber the write.
   local jd_file
   jd_file="$(mktemp "${TMPDIR:-/tmp}/batch-jd-${id}.XXXXXX")"
+  # The worker is a native process. Under Git Bash / MSYS the path above is a
+  # POSIX one (/tmp/... or /c/...) that a Windows binary cannot open, so every
+  # worker read "JD source unavailable" even when curl had filled the file.
+  # cygpath -m yields C:/... which both bash and the worker resolve.
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) command -v cygpath >/dev/null 2>&1 && jd_file="$(cygpath -m "$jd_file")" ;;
+  esac
+
+  # Pre-populate $jd_file with a static curl fetch so the worker reads HTML
+  # directly instead of always falling through to WebFetch (#2492). WebFetch is
+  # unreliable on JS-rendered boards (Phenom, Workday, iCIMS) because it hits
+  # the rendered JS shell rather than the actual JD text. curl returns the raw
+  # HTML in a single round-trip; for static boards that is exactly the JD.
+  # For JS-rendered boards the file will be thin (JS shell only), which the
+  # sufficiency check below detects — the file is then truncated to 0 bytes so
+  # the worker's Step-1 WebFetch fallback fires exactly as designed.
+  # If curl is absent or fails, $jd_file stays empty and WebFetch fires too.
+  # Minimum visible word count to treat a fetched page as a real JD rather than
+  # a JS shell. A JS app shell (Workday, Phenom, iCIMS) has near-zero visible
+  # words after HTML stripping; a real JD has hundreds. 80 is a conservative
+  # lower bound — any genuine posting has at least a title, summary, and a few
+  # requirements, which together exceed 80 stripped words.
+  local prefetch_min_words=80
+  local jd_prefetch_words=0
+  if command -v curl >/dev/null 2>&1; then
+    # Reject loopback, link-local, and private-network destinations before curl
+    # connects. --proto/--proto-redir restrict schemes but not destination IPs,
+    # so a malicious offer URL could reach cloud metadata (169.254.169.254) or
+    # internal services without this guard.
+    local _url_safe
+    local current_url="$url"
+    local redirect_count=0
+    local curl_status=0
+    local redirect_headers
+    local redirect_location
+    while :; do
+      _url_safe=$(node -e "
+      try {
+        const u = new URL(process.argv[1]);
+        const h = u.hostname.toLowerCase().replace(/\.\$/, '');
+        const blocked =
+          h === 'localhost' || h === 'localhost.localdomain' ||
+          h.endsWith('.local') || h.endsWith('.internal') ||
+          h.includes(':') ||
+          /^127\./.test(h) || /^169\.254\./.test(h) ||
+          /^10\./.test(h) || /^172\.(1[6-9]|2[0-9]|3[01])\./.test(h) ||
+          /^192\.168\./.test(h) || /^0\./.test(h);
+        process.stdout.write(blocked ? '0' : '1');
+      } catch (e) { process.stdout.write('0'); }
+      " "$current_url" 2>/dev/null)
+      if [[ "$_url_safe" != "1" ]]; then
+        echo "    ℹ️  JD prefetch: blocked — private/loopback destination ($current_url)"
+        : > "$jd_file"
+        break
+      else
+        redirect_headers="$(mktemp "${TMPDIR:-/tmp}/batch-jd-headers.XXXXXX")"
+        curl_status=0
+        curl --silent --show-error --location --max-redirs 0 \
+          --max-time 20 --connect-timeout 5 \
+          --fail --compressed \
+          --proto '=http,https' --proto-redir 'https,http' --max-filesize 5000000 \
+          --user-agent "Mozilla/5.0 (compatible; career-ops/batch)" \
+          --header "Accept: text/html,application/xhtml+xml,*/*;q=0.8" \
+          --dump-header "$redirect_headers" \
+          --output "$jd_file" \
+          -- "$current_url" 2>/dev/null || curl_status=$?
+        redirect_location=""
+        if [[ "$curl_status" -eq 47 ]]; then
+          redirect_location="$(awk 'tolower($0) ~ /^location:[[:space:]]*/ { value=$0; sub(/^[^:]*:[[:space:]]*/, "", value) } END { print value }' "$redirect_headers")"
+        fi
+        rm -f "$redirect_headers"
+        if [[ "$curl_status" -eq 47 && -n "$redirect_location" ]]; then
+          if [[ "$redirect_count" -ge 10 ]]; then
+            : > "$jd_file"
+            echo "    ℹ️  JD prefetch: too many redirects — worker will WebFetch"
+            break
+          fi
+          current_url="$(node -e "
+            try { process.stdout.write(new URL(process.argv[2], process.argv[1]).href); }
+            catch (e) { process.stdout.write(''); }
+          " "$current_url" "$redirect_location" 2>/dev/null)"
+          if [[ -z "$current_url" ]]; then
+            : > "$jd_file"
+            break
+          fi
+          redirect_count=$((redirect_count + 1))
+          continue
+        fi
+        if [[ "$curl_status" -ne 0 ]]; then
+          : > "$jd_file"
+        fi
+        break
+      fi
+    done
+      # Strip HTML tags and count visible words to distinguish a real JD (hundreds
+      # of words) from a JS shell (near zero visible text).
+      jd_prefetch_words=$(node -e "
+        const fs = require('fs');
+        try {
+          const text = fs.readFileSync(process.argv[1], 'utf-8')
+            .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&(nbsp|#160|#xa0);/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          fs.writeFileSync(process.argv[1], text);
+          process.stdout.write(String(text.split(' ').filter(Boolean).length));
+        } catch (e) { process.stdout.write('0'); }
+      " "$jd_file" 2>/dev/null) || jd_prefetch_words=0
+      # Ensure jd_prefetch_words is always a non-negative integer. A non-integer
+      # (e.g. empty string, "NaN") would cause bash arithmetic to fail or
+      # miscompare. Strip everything that is not a digit and default to 0.
+      jd_prefetch_words="${jd_prefetch_words//[^0-9]/}"
+      jd_prefetch_words="${jd_prefetch_words:-0}"
+      if [[ "$jd_prefetch_words" -lt "$prefetch_min_words" ]]; then
+        : > "$jd_file"
+        echo "    ℹ️  JD prefetch: thin content (${jd_prefetch_words} words) — worker will WebFetch"
+      else
+        echo "    ℹ️  JD prefetch: ${jd_prefetch_words} words written to JD file"
+      fi
+  fi
 
   echo "--- Processing offer #$id: $url (report $report_num, attempt $((retries + 1)))"
 
@@ -841,6 +929,9 @@ process_offer() {
   local esc_url esc_jd_file esc_report_num esc_date esc_id
   esc_url="${url//\\/\\\\}"
   esc_url="${esc_url//|/\\|}"
+  # In a sed replacement, & means "the whole match", so an unescaped & in a
+  # query-string URL splices {{URL}} back in and corrupts the interpolation.
+  esc_url="${esc_url//&/\\&}"
   esc_jd_file="${jd_file//\\/\\\\}"
   esc_jd_file="${esc_jd_file//|/\\|}"
   esc_report_num="${report_num//|/\\|}"
@@ -868,81 +959,34 @@ process_offer() {
     fi
   done
 
-  # Launch worker (dispatches based on --cli flag).
-  # The model is resolved once per run from spend_tier unless --model was
-  # passed. Building the command in an array keeps quoting safe regardless.
-  # For Hermes: -z = one-shot mode (prints only final response), --yolo = bypass
-  # approvals (like claude's --dangerously-skip-permissions), --accept-hooks =
-  # auto-approve shell hooks for headless runs. AGENTS.md is auto-loaded from CWD
-  # by Hermes, so we pass the resolved prompt as the oneshot payload.
-  # For Claude: -p = oneshot, --permission-mode auto = bypass approvals,
-  # --strict-mcp-config = no MCP servers (avoids Playwright deadlock with --parallel > 1).
-  # For Codex: exec = non-interactive, --dangerously-bypass-approvals-and-sandbox =
-  # no approval prompts and full disk/network (workers need web + Playwright),
-  # --skip-git-repo-check, --ignore-user-config = skip ambient config.toml MCP
-  # servers (same deadlock concern as claude's --strict-mcp-config). The prompt
-  # is piped via stdin to avoid argv-length limits on long resolved prompts.
-  local -a worker_args=()
-  case "$CLI" in
-    hermes)
-      # Hermes one-shot payload: resolved prompt (with templates filled + user-layer
-      # files appended) + the actual prompt. We embed both as the oneshot message.
-      local payload
-      payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
-      worker_args=(-z "$payload" --yolo --accept-hooks --provider "$RESOLVED_HERMES_PROVIDER" --model "$RESOLVED_MODEL")
-      # Ensure required toolsets are enabled (web search, file ops, terminal, browser, code)
-      worker_args+=(-t web,file,terminal,browser,code_execution)
-      ;;
-    agy|agy-google|agy-other)
-      # Antigravity CLI: -p = print mode (non-interactive), --dangerously-skip-permissions
-      # = auto-approve all tool requests. AGY auto-loads AGENTS.md from CWD.
-      # Two usage-class variants (agy meters Gemini separately from Claude/GPT):
-      #   agy / agy-google → Gemini 3.5 Flash (Medium)  [Gemini pool]
-      #   agy-other        → Claude Sonnet 4.6 Thinking [Claude pool]
-      local agy_payload
-      agy_payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
-      worker_args=(-p "$agy_payload" --dangerously-skip-permissions)
-      # Resolve model: --model override wins, else the variant's usage-class
-      # default. RESOLVED_MODEL is a Claude *CLI* model id (e.g. claude-sonnet-5)
-      # resolved from spend_tier — it is NOT valid for agy, which wants display
-      # names like "Claude Sonnet 4.6 (Thinking)". So only use it for claude;
-      # agy variants always take their class default unless the user passed
-      # --model explicitly (MODEL, not RESOLVED_MODEL).
-      if [[ -n "$MODEL" ]]; then
-        worker_args+=(--model "$MODEL")
-      elif [[ "$CLI" == "agy-other" ]]; then
-        worker_args+=(--model "Claude Sonnet 4.6 (Thinking)")
-      else
-        worker_args+=(--model "Gemini 3.5 Flash (Medium)")
-      fi
-      # Increase print timeout to 15 minutes for complex multi-step evaluations
-      worker_args+=(--print-timeout 15m)
-      # Per-worker log file for debugging
-      worker_args+=(--log-file "$LOGS_DIR/${report_num}-${id}-agy.log")
-      ;;
-    codex)
-      # Codex CLI: exec = non-interactive. Prompt goes on stdin (see launch
-      # below); resolved system-prompt file is concatenated ahead of the prompt.
-      worker_args=(exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check)
-      # Don't load ambient config.toml MCP servers (Playwright deadlock with
-      # --parallel > 1), same intent as claude's --strict-mcp-config.
-      worker_args+=(--ignore-user-config)
-      if [[ -n "$MODEL" ]]; then
-        worker_args+=(-m "$MODEL")
-      elif [[ -n "$RESOLVED_MODEL" ]]; then
-        worker_args+=(-m "$(codex_model_alias "$RESOLVED_MODEL")")
-      fi
-      ;;
-    claude|*)
-      # Default: Claude Code. NOTE: must stay LAST — it's the catch-all.
-      worker_args=(-p --permission-mode auto --strict-mcp-config)
-      if [[ -n "$RESOLVED_MODEL" ]]; then
-        worker_args+=(--model "$RESOLVED_MODEL")
-      fi
-      worker_args+=(--append-system-prompt-file "$resolved_prompt" "$prompt")
-      ;;
-  esac
+  # Build the launch command for the configured CLI.
+  # For claude the model is resolved once per run from spend_tier unless --model
+  # was passed; other CLIs take --model verbatim. Building claude's command in an
+  # array keeps quoting safe regardless.
+  # --strict-mcp-config (with no --mcp-config) starts workers with no MCP
+  # servers: they only evaluate offers and need none. Without it each parallel
+  # worker inherits the parent session's MCP (e.g. Playwright) and they deadlock
+  # fighting over the single shared browser when --parallel > 1 (issue #506).
+  local -a claude_args=(-p --dangerously-skip-permissions --strict-mcp-config)
+  if [[ -n "$RESOLVED_MODEL" ]]; then
+    claude_args+=(--model "$RESOLVED_MODEL")
+  fi
+  claude_args+=(--append-system-prompt-file "$resolved_prompt" "$prompt")
 
+  # Non-claude CLIs lack --append-system-prompt-file, so concatenate the
+  # resolved system prompt and the per-job prompt into a single argument.
+  # model_args is expanded with the ${arr[@]+"${arr[@]}"} idiom below: under
+  # `set -u`, bash 3.2 (macOS /bin/bash) treats an empty array expansion as an
+  # unbound variable and would abort every worker launched without --model.
+  local full_prompt=""
+  local -a model_args=()
+  if [[ "$CLI" != "claude" ]]; then
+    full_prompt="$(cat "$resolved_prompt")"$'\n\n'"$prompt"
+    [[ -n "$MODEL" ]] && model_args=(--model "$MODEL")
+  fi
+
+  # Non-claude CLIs run a single attempt (explicit break after dispatch); the
+  # rate-limit/session retry loop only applies to claude.
   local exit_code=0
   local terminal_failure_recorded=false
   local shim_retries=0
@@ -950,28 +994,43 @@ process_offer() {
   while true; do
     exit_code=0
     case "$CLI" in
-      hermes)
-        "$HERMES_BIN" "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+      claude)
+        claude "${claude_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
-      agy|agy-google|agy-other)
-        agy "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+      opencode)
+        if command -v opencode &>/dev/null; then
+          opencode run ${model_args[@]+"${model_args[@]}"} "$full_prompt" > "$log_file" 2>&1 || exit_code=$?
+        else
+          ollama launch opencode ${model_args[@]+"${model_args[@]}"} -y -- run "$full_prompt" > "$log_file" 2>&1 || exit_code=$?
+        fi
         ;;
-      codex)
-        # Prompt piped via stdin ('-' = read from stdin): the resolved system
-        # prompt file is large and argv-length limits bite on long prompts.
-        { cat "$resolved_prompt"; printf '\n\n---\n\n%s\n' "$prompt"; } \
-          | codex "${worker_args[@]}" - > "$log_file" 2>&1 || exit_code=$?
+      gemini)
+        gemini ${model_args[@]+"${model_args[@]}"} -p "$full_prompt" > "$log_file" 2>&1 || exit_code=$?
         ;;
-      claude|*)
-        claude "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+      qwen)
+        qwen ${model_args[@]+"${model_args[@]}"} -p "$full_prompt" > "$log_file" 2>&1 || exit_code=$?
         ;;
     esac
 
-    # Rate/session-limit detection must run BEFORE the exit_code==0 fast path:
-    # some CLIs (observed with hermes) exit 0 even when the underlying API
-    # call failed (e.g. "API call failed after 3 retries: HTTP 429" printed
-    # to the log), so gating this on a nonzero exit code let 429s silently
-    # get marked "completed" with no report file. Always inspect the log.
+    # Non-claude CLIs run a single attempt: the session-limit and rate-limit
+    # detection below greps generic phrases (429, quota, session limit) that
+    # another CLI's log could match by coincidence and pause or retry the batch.
+    if [[ "$CLI" != "claude" ]]; then
+      break
+    fi
+
+    if [[ $exit_code -eq 0 ]]; then
+      break
+    fi
+
+    # Check for Claude Code npm shim swap (exit code 127 + command not found)
+    if [[ $exit_code -eq 127 ]] && grep -qE "(claude: command not found|claude:.*not found|cannot find.*claude)" "$log_file" && (( shim_retries < max_shim_retries )); then
+      shim_retries=$((shim_retries + 1))
+      echo "    ⏳ Claude command not found (shim swap detected). Retrying in 30s (attempt $shim_retries/$max_shim_retries)..."
+      sleep 30
+      continue
+    fi
+
     if is_session_limit_log "$log_file"; then
       mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
       echo "    ⏸️  Session/rate limit reached; pausing batch without consuming retry budget."
@@ -989,114 +1048,130 @@ process_offer() {
       retries=$((retries + 1))
       local retry_completed_at
       retry_completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-      update_state_retrying "$id" "$url" "rate_limited" "$started_at" "$retry_completed_at" "$report_num" "-" "rate-limit; retrying after ${RATE_LIMIT_SLEEP}s" "$retries"
+      update_state_retrying "$id" "$url" "rate_limited" "$started_at" "$retry_completed_at" "$report_num" "-" "rate-limit; retrying after ${RATE_LIMIT_SLEEP}s" "$retries" || true
       echo "    ⏳ Rate limited (attempt $retries/$MAX_RETRIES). Waiting ${RATE_LIMIT_SLEEP}s before retry..."
       sleep "$RATE_LIMIT_SLEEP"
       continue
     fi
 
-    if [[ $exit_code -eq 0 ]]; then
-      break
-    fi
-
-    # Check for CLI-specific transient errors
-    case "$CLI" in
-      hermes)
-        # Hermes-specific retry logic can be added here if needed
-        ;;
-      codex)
-        # Codex streamable-http MCP session teardown can log an rmcp HTTP 400
-        # after a successful run; only retry on genuine transport failures.
-        if [[ $exit_code -ne 0 ]] && grep -q "stream error.*unexpected status" "$log_file" && (( shim_retries < max_shim_retries )); then
-          shim_retries=$((shim_retries + 1))
-          echo "    ⏳ Codex stream error. Retrying in 30s (attempt $shim_retries/$max_shim_retries)..."
-          sleep 30
-          continue
-        fi
-        ;;
-      claude|*)
-        # Check for Claude Code npm shim swap (exit code 127 + command not found)
-        if [[ $exit_code -eq 127 ]] && grep -qE "(claude: command not found|claude:.*not found|cannot find.*claude)" "$log_file" && (( shim_retries < max_shim_retries )); then
-          shim_retries=$((shim_retries + 1))
-          echo "    ⏳ Claude command not found (shim swap detected). Retrying in 30s (attempt $shim_retries/$max_shim_retries)..."
-          sleep 30
-          continue
-        fi
-        ;;
-    esac
-
     break
   done
 
-  # Cleanup resolved prompt
-  # Cleanup resolved prompt
-  rm -f "$resolved_prompt"
+  # Cleanup resolved prompt and pre-fetched JD file
+  rm -f "$resolved_prompt" "$jd_file"
 
   local completed_at
   completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-  # Detect the worker's own hard-stop JSON fence: some prompts (e.g. dead
-  # URL / empty JD) correctly refuse to score and emit
-  # {"status": "failed", ...} while still exiting 0. Treat that as a real
-  # failure so it retries/surfaces instead of being recorded "completed"
-  # with a dash score and no report file (silently invisible in the
-  # pipeline once max-retries suppresses it from future runs).
-  local worker_reported_failed=false
-  if grep -q '"status"[[:space:]]*:[[:space:]]*"failed"' "$log_file" 2>/dev/null; then
-    worker_reported_failed=true
-  fi
+  if [[ $exit_code -eq 0 ]]; then
+    # A worker can exit 0 (no crash) but still self-report failure inside its
+    # own JSON summary — e.g. it correctly declines to fabricate an evaluation
+    # when the JD couldn't be extracted (Data Contract: never fabricate).
+    # Without this check such offers were silently marked "completed" with no
+    # report file on disk and score "-" (found 2026-07-29, offer id 6 / report
+    # 019 — Deepgram JD unextractable in headless mode). Only the downstream
+    # reconcile-pipeline.mjs safety net (which leaves an entry in Pending when
+    # its report file is missing) prevented the offer from being lost.
+    # Extract only the LAST ```json fenced block in the log -- that's the
+    # worker's one authoritative final result (batch-prompt.md Step 6), not
+    # arbitrary text anywhere else in stdout/stderr -- and parse it as real
+    # JSON so an unrelated line merely containing the substring
+    # `"status": "failed"` can never falsely flip a successful run.
+    local worker_result_json
+    worker_result_json=$(awk '
+      /^```json[[:space:]]*$/ { in_block=1; block=""; next }
+      in_block && /^```[[:space:]]*$/ { in_block=0; last=block; next }
+      in_block { block = block $0 "\n" }
+      END { printf "%s", last }
+    ' "$log_file" 2>/dev/null || true)
 
-  # Verify the worker's claimed report file actually exists on disk. Two
-  # failure modes observed in practice both exit 0 with no "status":"failed"
-  # string, so neither is caught by the check above: (1) the model narrates
-  # a full success summary — including a specific reports/NNNN-*.md path —
-  # that it never actually wrote (a file-write hallucination); (2) a garbled/
-  # truncated response ("Model generated invalid tool call: shell") that
-  # never reaches the JSON fence at all, leaving no score and no file. Both
-  # were previously recorded "completed" with a dash score, silently
-  # dropping the offer from the pipeline. A genuinely successful run always
-  # writes reports/${report_num}-*.md regardless of score (SKIP recommendations
-  # get a report too) — so require that file to exist before trusting the log.
-  # A brief settle-retry guards against a write-then-stat visibility race: a
-  # worker process can exit (and our exit_code capture happen) a beat before
-  # its last file write is visible to a fresh glob in this shell — observed
-  # in practice discarding a fully complete, valid 95K-token report as a
-  # false "missing" only seconds after the worker's own process exited. A
-  # genuine hallucination/failure never produces the file even after waiting,
-  # so this retry costs real hallucinations nothing while saving real ones.
-  local worker_report_missing=false
-  if [[ -n "$report_num" && "$report_num" != "-" ]]; then
-    local report_glob=("$REPORTS_DIR/${report_num}-"*.md)
-    local settle_attempt=0
-    while [[ ! -f "${report_glob[0]}" && $settle_attempt -lt 3 ]]; do
-      sleep 1
-      report_glob=("$REPORTS_DIR/${report_num}-"*.md)
-      settle_attempt=$((settle_attempt + 1))
-    done
-    if [[ ! -f "${report_glob[0]}" ]]; then
-      worker_report_missing=true
+    # Parse status, error, AND score from the same authoritative JSON object
+    # in one pass -- score extraction used to be a separate sed regex over
+    # the whole log (`.*"score":...`), which grabbed the first match
+    # anywhere in the log rather than the one from this final result object,
+    # producing a spurious score "-" whenever an earlier line in the log
+    # (reasoning text, an intermediate example, Block D's "Comp score: 4/5"
+    # mention, etc.) matched first. Reading it from the same parsed object
+    # as status/error fixes both by construction -- there's only one place
+    # left to look.
+    local worker_failed_match="" worker_error_match="" score="-"
+    if [[ -n "$worker_result_json" ]]; then
+      local parsed
+      parsed=$(printf '%s' "$worker_result_json" | node -e '
+        let data = "";
+        process.stdin.on("data", d => data += d);
+        process.stdin.on("end", () => {
+          try {
+            const obj = JSON.parse(data);
+            const status = typeof obj.status === "string" ? obj.status : "";
+            const error = typeof obj.error === "string" ? obj.error : "";
+            const score = typeof obj.score === "number" ? String(obj.score) : "";
+            process.stdout.write(status + "\x1f" + error + "\x1f" + score);
+          } catch {
+            process.stdout.write("");
+          }
+        });
+      ' 2>/dev/null || true)
+      if [[ -n "$parsed" ]]; then
+        # \x1f (US), not \t: tab is IFS *whitespace*, so bash collapses runs of it
+        # and strips leading/trailing ones. On the common path -- a worker that
+        # succeeded, so `error` is empty -- the two tabs around that empty field
+        # collapse into one, `score` slides into parsed_error, and parsed_score
+        # comes back empty. The `elif` below then never fires and every
+        # successful offer records score "-". A non-whitespace delimiter gets
+        # one-field-per-unit splitting with empty fields preserved.
+        IFS=$'\x1f' read -r parsed_status parsed_error parsed_score <<< "$parsed"
+        if [[ "$parsed_status" == "failed" ]]; then
+          worker_failed_match="failed"
+          worker_error_match="$parsed_error"
+        elif [[ -n "$parsed_score" ]]; then
+          score="$parsed_score"
+        fi
+      fi
     fi
-  fi
 
-  if [[ $exit_code -eq 0 && "$worker_reported_failed" == "false" && "$worker_report_missing" == "false" ]]; then
-    # Try to extract score from worker output
-    local score="-"
-    local score_match
-   score_match=$(sed -nE 's/.*"score":[[:space:]]*([0-9.]+).*/\1/p' "$log_file" 2>/dev/null | head -1 || true)
-    if [[ -n "$score_match" ]]; then
-      score="$score_match"
+    if [[ -n "$worker_failed_match" ]]; then
+      [[ -z "$worker_error_match" ]] && worker_error_match="worker reported status:failed (exit code 0)"
+      if (( retries < MAX_RETRIES )); then
+        retries=$((retries + 1))
+      fi
+      update_state_retrying "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$worker_error_match" "$retries" || true
+      release_report_num "$report_num"
+      echo "    ❌ Failed (worker-reported, attempt $retries): $worker_error_match"
+      return 0
+    fi
+
+    # A worker can exit 0, self-report a non-"failed" status (or no parseable
+    # JSON at all), and STILL never actually write the report file it claims
+    # -- exit code and JSON status alone are not proof a report exists. Found
+    # 2026-07-30: offer id 6/report 049 was marked "completed" this way with
+    # no file on disk, silently freeing that number for a second, unrelated
+    # offer to claim (a real collision). Verify the file before trusting
+    # "completed" -- fail closed, not open.
+    if [[ -z "$(compgen -G "$REPORTS_DIR/${report_num}-*.md")" ]]; then
+      if (( retries < MAX_RETRIES )); then
+        retries=$((retries + 1))
+      fi
+      update_state_retrying "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "worker exited cleanly but wrote no report file for this report number" "$retries" || true
+      release_report_num "$report_num"
+      echo "    ❌ Failed (no report file on disk, attempt $retries)"
+      return 0
     fi
 
     # Check min-score gate
-    if is_decimal_number "$score" && awk -v min="$MIN_SCORE" 'BEGIN{exit !(min > 0)}'; then
-      if awk -v score="$score" -v min="$MIN_SCORE" 'BEGIN{exit !(score < min)}'; then
-        update_state_retrying "$id" "$url" "skipped" "$started_at" "$completed_at" "$report_num" "$score" "below-min-score" "$retries"
+    if is_decimal_number "$score" && LC_ALL=C awk -v min="$MIN_SCORE" 'BEGIN{exit !(min > 0)}'; then
+      # LC_ALL=C: under a non-English locale awk parses "4.5" as 4, so the
+      # MIN_SCORE comparison would silently run on truncated integers.
+      if LC_ALL=C awk -v score="$score" -v min="$MIN_SCORE" 'BEGIN{exit !(score < min)}'; then
+        update_state_retrying "$id" "$url" "skipped" "$started_at" "$completed_at" "$report_num" "$score" "below-min-score" "$retries" || true
+        release_report_num "$report_num"
         echo "    ⏭️  Skipped (score: $score < min-score: $MIN_SCORE)"
         return 0
       fi
     fi
 
-    update_state_retrying "$id" "$url" "completed" "$started_at" "$completed_at" "$report_num" "$score" "-" "$retries"
+    update_state_retrying "$id" "$url" "completed" "$started_at" "$completed_at" "$report_num" "$score" "-" "$retries" || true
+    release_report_num "$report_num"
     echo "    ✅ Completed (score: $score, report: $report_num)"
   elif [[ "$terminal_failure_recorded" == "false" ]]; then
     if (( retries < MAX_RETRIES )); then
@@ -1104,7 +1179,8 @@ process_offer() {
     fi
     local error_msg
     error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "Unknown error (exit code $exit_code)")
-    update_state_retrying "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries"
+    update_state_retrying "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries" || true
+    release_report_num "$report_num"
     echo "    ❌ Failed (attempt $retries, exit code $exit_code)"
   fi
 }
@@ -1141,7 +1217,7 @@ print_summary() {
     case "$sstatus" in
       completed) completed=$((completed + 1))
         if is_decimal_number "$sscore"; then
-          score_sum=$(awk -v sum="$score_sum" -v score="$sscore" 'BEGIN{print sum + score}' 2>/dev/null || echo "$score_sum")
+          score_sum=$(LC_ALL=C awk -v sum="$score_sum" -v score="$sscore" 'BEGIN{print sum + score}' 2>/dev/null || echo "$score_sum")
           score_count=$((score_count + 1))
         fi
         ;;
@@ -1155,8 +1231,16 @@ print_summary() {
 
   if (( score_count > 0 )); then
     local avg
-    avg=$(awk -v sum="$score_sum" -v count="$score_count" 'BEGIN{printf "%.1f", sum / count}' 2>/dev/null || echo "N/A")
+    # LC_ALL=C: under e.g. a German locale awk formats "%.1f" as "4,5"
+    # instead of "4.5", and a decimal comma breaks every downstream parser.
+    avg=$(LC_ALL=C awk -v sum="$score_sum" -v count="$score_count" 'BEGIN{printf "%.1f", sum / count}' 2>/dev/null || echo "N/A")
     echo "Average score: $avg/5 ($score_count scored)"
+  fi
+
+  if [[ -f "$BATCH_DIR/aggregate-tokens.mjs" ]]; then
+    if ! node "$BATCH_DIR/aggregate-tokens.mjs"; then
+      echo "Warning: token aggregation failed." >&2
+    fi
   fi
 }
 
@@ -1186,7 +1270,7 @@ print_status_table() {
       completed)
         completed=$((completed + 1))
         if is_decimal_number "$sscore"; then
-          score_sum=$(awk -v sum="$score_sum" -v score="$sscore" 'BEGIN{print sum + score}' 2>/dev/null || echo "$score_sum")
+          score_sum=$(LC_ALL=C awk -v sum="$score_sum" -v score="$sscore" 'BEGIN{print sum + score}' 2>/dev/null || echo "$score_sum")
           score_count=$((score_count + 1))
         fi
         ;;
@@ -1203,7 +1287,9 @@ print_status_table() {
   echo "Total: $total | Completed: $completed | Processing: $processing | Failed: $failed | Pending: $pending | Skipped: $skipped | Rate Limited: $rate_limited | Paused: $paused_rate_limit"
   if (( score_count > 0 )); then
     local avg
-    avg=$(awk -v sum="$score_sum" -v count="$score_count" 'BEGIN{printf "%.1f", sum / count}' 2>/dev/null || echo "N/A")
+    # LC_ALL=C: under e.g. a German locale awk formats "%.1f" as "4,5"
+    # instead of "4.5", and a decimal comma breaks every downstream parser.
+    avg=$(LC_ALL=C awk -v sum="$score_sum" -v count="$score_count" 'BEGIN{printf "%.1f", sum / count}' 2>/dev/null || echo "N/A")
     echo "Average score: $avg/5 ($score_count scored)"
   fi
   echo ""
@@ -1283,28 +1369,7 @@ main() {
 
   check_prerequisites
 
-  # Merge any recovery records left by a prior interrupted run (single-threaded,
-  # before workers spawn — v1.28.0 feature)
-  reconcile_recovery_records
-
   resolve_worker_model
-
-  # For Hermes, default to the nous pool's free poolside model unless the
-  # caller explicitly overrode --model and/or --provider (e.g. to route
-  # through OpenRouter: --provider openrouter --model z-ai/glm-5.2:free).
-  # RESOLVED_SPEND_TIER is cosmetic here (shown in the run banner) and just
-  # mirrors whichever provider ends up in effect.
-  if [[ "$CLI" == "hermes" ]]; then
-    if [[ -z "$MODEL" ]]; then
-      RESOLVED_MODEL="poolside/laguna-xs-2.1:free"
-    fi
-    if [[ -n "$PROVIDER" ]]; then
-      RESOLVED_HERMES_PROVIDER="$PROVIDER"
-    else
-      RESOLVED_HERMES_PROVIDER="nous"
-    fi
-    RESOLVED_SPEND_TIER="$RESOLVED_HERMES_PROVIDER"
-  fi
 
   if [[ "$DRY_RUN" == "false" ]]; then
     acquire_lock
@@ -1312,6 +1377,10 @@ main() {
   fi
 
   init_state
+
+  if [[ "$DRY_RUN" == "false" ]]; then
+    reconcile_recovery_records
+  fi
 
   # Count input offers (skip header, ignore blank lines)
   local total_input
@@ -1330,9 +1399,11 @@ main() {
     echo "Parallel: $PARALLEL | Max retries: $MAX_RETRIES"
   fi
   if [[ "$RESOLVED_SPEND_TIER" == "override" ]]; then
-    echo "Model: $RESOLVED_MODEL (explicit --model override)"
+    echo "CLI: $CLI | Model: $RESOLVED_MODEL (explicit --model override)"
+  elif [[ "$RESOLVED_SPEND_TIER" == "cli-default" ]]; then
+    echo "CLI: $CLI | Model: $CLI default"
   else
-    echo "Model: $RESOLVED_MODEL (spend_tier=${RESOLVED_SPEND_TIER})"
+    echo "CLI: $CLI | Model: $RESOLVED_MODEL (spend_tier=${RESOLVED_SPEND_TIER})"
   fi
   echo "Input: $total_input offers"
   echo ""
@@ -1450,36 +1521,20 @@ main() {
         break
       fi
 
-      # Wait if we're at parallel limit (guard: pids can be empty when both
-      # workers in the first wave exited before PID recording — expanding an
-      # empty array aborts under `set -u` on bash < 4.4)
+      # Wait if we're at parallel limit
       while (( running >= PARALLEL )); do
-        if (( ${#pids[@]} > 0 )); then
-          for j in "${!pids[@]}"; do
-            if ! kill -0 "${pids[$j]}" 2>/dev/null; then
-              wait "${pids[$j]}" 2>/dev/null || true
-              unset 'pids[j]'
-              unset 'pid_ids[j]'
-              running=$((running - 1))
-            fi
-          done
-          # Compact arrays. Guard: if every element was just unset above, the
-          # array is now fully empty, and expanding "${pids[@]}" on a fully
-          # empty array aborts with "unbound variable" under `set -u` on
-          # bash 3.2 (macOS default) even though bash 4.4+ handles it fine.
-          if (( ${#pids[@]} > 0 )); then
-            pids=("${pids[@]}")
-          else
-            pids=()
+        # Wait for any child to finish
+        for j in "${!pids[@]}"; do
+          if ! kill -0 "${pids[$j]}" 2>/dev/null; then
+            wait "${pids[$j]}" 2>/dev/null || true
+            unset 'pids[j]'
+            unset 'pid_ids[j]'
+            running=$((running - 1))
           fi
-          if (( ${#pid_ids[@]} > 0 )); then
-            pid_ids=("${pid_ids[@]}")
-          else
-            pid_ids=()
-          fi
-        else
-          sleep 1
-        fi
+        done
+        # Compact arrays
+        pids=("${pids[@]}")
+        pid_ids=("${pid_ids[@]}")
         if [[ "$BATCH_PAUSED" == "true" || -f "$PAUSE_FILE" ]]; then
           echo "=== Batch paused: session/rate limit reached. Waiting for running workers, not scheduling new offers. ==="
           break
@@ -1498,14 +1553,10 @@ main() {
       running=$((running + 1))
     done
 
-    # Wait for remaining workers (guard: workers can all exit before a PID is
-    # recorded — e.g. both fail instantly — leaving the array empty, and
-    # expanding an empty array aborts under `set -u` on bash < 4.4)
-    if (( ${#pids[@]} > 0 )); then
-      for pid in "${pids[@]}"; do
-        wait "$pid" 2>/dev/null || true
-      done
-    fi
+    # Wait for remaining workers
+    for pid in "${pids[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
   fi
 
   # Merge tracker additions
