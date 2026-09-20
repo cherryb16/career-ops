@@ -272,6 +272,23 @@ If evidence is thin, default to `Proceed with Caution` and explain the limitatio
 
 #### Global Score
 
+**Hard-block score caps — apply BEFORE the dimension table.** Certain requirements are hard blockers, not scored dimensions. When one fires, the global score is **capped** no matter how strong CV-match/comp/culture look, and `final_decision` must be `Skip`.
+
+| Hard blocker | Cap | final_decision |
+|---|---|---|
+| **Seniority hard-stop** — JD requires ≥3 yrs professional (non-internship) experience AND candidate has <1 yr (current student per `cv.md` / `config/profile.yml`). A 5+ yr requirement is definitive. | ≤ 2.0 | Skip |
+| **Credential gate** — JD requires a degree/license/clearance the candidate lacks (JD/bar, active TS/SCI, CPA, graduate degree for an undergrad-only role). | ≤ 1.5 | Skip |
+| **Shift-pattern violation** — night / weekend / rotating shifts (per `config/profile.yml` `schedule_constraints`). | ≤ 2.0 | Skip |
+| **No-sponsorship + out-of-country** — JD explicitly declines sponsorship AND role is outside the candidate's authorized countries. | ≤ 2.0 | Skip |
+
+Seniority hard-stop rules (most frequent mis-score):
+- Read the JD's experience requirement **literally**. "6+ years", "8-10 years", "3+ years professional" vs a current student with internship-only experience → hard-stop fires.
+- A strong CV match or high comp band must NOT compensate. The cap applies to the **global** score regardless of individual dimensions.
+- State the hard-stop verbatim in `hard_stops` and in the report notes; set `recommendation`/`final_decision` to `Skip`.
+- Titles with "Lead", "Manager III", "Senior", "Staff", "Principal", "Experienced" are a signal to READ the experience line before scoring 4+ — they do not by themselves trigger the cap.
+
+**Relocation is NEVER a blocker or a penalty** for full-time post-grad roles — the candidate is open to relocation. Do NOT write "relocation required" as a concern or set `geo_restriction` in `discard_reasons` for a non-local full-time role. The only valid location penalties are shift-pattern violations and out-of-country (work-auth) cases.
+
 Provide a score table:
 
 | Dimension | Score |
@@ -281,7 +298,7 @@ Provide a score table:
 | Compensation | X/5 |
 | Culture / working model | X/5 |
 | Red flags | -X if any |
-| **Global** | **X.X/5** |
+| **Global** | **X.X/5** (≤ hard-block cap when one fires) |
 
 #### Machine Summary
 

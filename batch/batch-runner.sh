@@ -18,6 +18,23 @@ PROFILE_FILE="$PROJECT_DIR/config/profile.yml"
 LOGS_DIR="$BATCH_DIR/logs"
 DISCARD_LOG="$LOGS_DIR/discard.log"
 TRACKER_DIR="$BATCH_DIR/tracker-additions"
+
+# Resolve the hermes binary explicitly rather than relying on `hermes` being
+# first on PATH. Hermes ships its own venv (with PyYAML etc. installed) at
+# ~/.hermes/hermes-agent/venv/bin/hermes; the launcher script's
+# `#!/usr/bin/env python3` shebang means if the CALLER's PATH happens to put
+# a system/Homebrew python3 ahead of that venv (e.g. a shell that hasn't
+# sourced the venv), `hermes` on PATH resolves to a python3 that's missing
+# hermes_cli's deps (or, on macOS's stock Python 3.9, too old for the
+# `str | None` syntax hermes_cli uses) and every offer silently fails with a
+# traceback in its log. Prefer the venv binary when present; PATH is only a
+# fallback for installs that don't use this venv layout.
+HERMES_VENV_BIN="$HOME/.hermes/hermes-agent/venv/bin/hermes"
+if [[ -x "$HERMES_VENV_BIN" ]]; then
+  HERMES_BIN="$HERMES_VENV_BIN"
+else
+  HERMES_BIN="hermes"
+fi
 REPORTS_DIR="$PROJECT_DIR/reports"
 APPLICATIONS_FILE="$PROJECT_DIR/data/applications.md"
 LOCK_FILE="${BATCH_LOCK_FILE:-$BATCH_DIR/batch-runner.pid}"
@@ -39,8 +56,10 @@ MAX_RETRIES=2
 MIN_SCORE=0
 SKIP_PDF=false
 MODEL=""  # explicit override; otherwise resolved from config/profile.yml spend_tier
+PROVIDER=""  # explicit override for the hermes CLI's --provider flag; default: nous
 RESOLVED_MODEL=""
 RESOLVED_SPEND_TIER=""
+RESOLVED_HERMES_PROVIDER=""
 RATE_LIMIT_SLEEP=300
 BATCH_PAUSED=false
 STATUS_ONLY=false
@@ -74,7 +93,13 @@ Options:
   --rate-limit-sleep N Seconds to wait before retrying a rate-limited worker
                        (default: 300)
   --model NAME         Override the tier-resolved model (otherwise uses config/profile.yml
-                       spend_tier: economy/standard/premium; default standard)
+                       spend_tier: economy/standard/premium; default standard).
+                       For --cli hermes, this is the hermes/OpenRouter model id
+                       (default: poolside/laguna-xs-2.1:free).
+  --provider NAME      Override the hermes CLI's --provider flag (default: nous).
+                       Only used by --cli hermes; e.g. --provider openrouter
+                       --model z-ai/glm-5.2:free routes through OpenRouter instead
+                       of the nous pool.
   --status             Show batch progress and a per-job table, then exit
   --watch              Live-refresh progress until the run completes
   -h, --help           Show this help
@@ -98,6 +123,9 @@ Examples:
 
   # Process 2 at a time starting from ID 10
   ./batch-runner.sh --parallel 2 --start-from 10
+
+  # Run hermes through OpenRouter instead of the default nous pool
+  ./batch-runner.sh --cli hermes --provider openrouter --model z-ai/glm-5.2:free
 USAGE
 }
 
@@ -119,6 +147,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --model) MODEL="$2"; shift 2 ;;
+    --provider) PROVIDER="$2"; shift 2 ;;
     --cli) CLI="$2"; shift 2 ;;
     --status) STATUS_ONLY=true; shift ;;
     --watch) WATCH_MODE=true; shift ;;
@@ -233,8 +262,8 @@ check_prerequisites() {
   # Validate the selected CLI binary exists
   case "$CLI" in
     hermes)
-      if ! command -v hermes >/dev/null 2>&1; then
-        echo "ERROR: 'hermes' CLI not found in PATH. Install Hermes or use --cli claude."
+      if [[ ! -x "$HERMES_BIN" ]] && ! command -v "$HERMES_BIN" >/dev/null 2>&1; then
+        echo "ERROR: hermes CLI not found (tried '$HERMES_BIN'). Install Hermes or use --cli claude."
         exit 1
       fi
       ;;
@@ -735,7 +764,13 @@ is_rate_limit_log() {
 
 is_session_limit_log() {
   local log_file="$1"
-  grep -Eiq '(session limit|resets [0-9:]+[ap]m|usage limit|limit[[:space:]]+reached)' "$log_file"
+  # "Individual quota reached...Resets in Xh" is agy's Gemini/Claude usage-class
+  # exhaustion message — same shape as the other session-limit strings (a hard
+  # stop with its own reset clock), not a transient rate limit worth retrying
+  # within this run. Without "quota reached" here it fell through to
+  # is_rate_limit_log (which only matched "quota exceeded", different wording)
+  # and burned through MAX_RETRIES marking every remaining offer "failed".
+  grep -Eiq '(session limit|resets [0-9:]+[ap]m|usage limit|limit[[:space:]]+reached|quota[[:space:]]+reached)' "$log_file"
 }
 
 mark_paused_rate_limit() {
@@ -854,7 +889,7 @@ process_offer() {
       # files appended) + the actual prompt. We embed both as the oneshot message.
       local payload
       payload="$(cat "$resolved_prompt")"$'\n\n---\n\n'"$prompt"
-      worker_args=(-z "$payload" --yolo --accept-hooks --provider nous --model poolside/laguna-xs-2.1:free)
+      worker_args=(-z "$payload" --yolo --accept-hooks --provider "$RESOLVED_HERMES_PROVIDER" --model "$RESOLVED_MODEL")
       # Ensure required toolsets are enabled (web search, file ops, terminal, browser, code)
       worker_args+=(-t web,file,terminal,browser,code_execution)
       ;;
@@ -916,7 +951,7 @@ process_offer() {
     exit_code=0
     case "$CLI" in
       hermes)
-        hermes "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+        "$HERMES_BIN" "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
       agy|agy-google|agy-other)
         agy "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
@@ -931,6 +966,34 @@ process_offer() {
         claude "${worker_args[@]}" > "$log_file" 2>&1 || exit_code=$?
         ;;
     esac
+
+    # Rate/session-limit detection must run BEFORE the exit_code==0 fast path:
+    # some CLIs (observed with hermes) exit 0 even when the underlying API
+    # call failed (e.g. "API call failed after 3 retries: HTTP 429" printed
+    # to the log), so gating this on a nonzero exit code let 429s silently
+    # get marked "completed" with no report file. Always inspect the log.
+    if is_session_limit_log "$log_file"; then
+      mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
+      echo "    ⏸️  Session/rate limit reached; pausing batch without consuming retry budget."
+      terminal_failure_recorded=true
+      break
+    fi
+
+    if is_rate_limit_log "$log_file" && (( retries < MAX_RETRIES )); then
+      if (( RATE_LIMIT_SLEEP <= 0 )); then
+        mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
+        echo "    ⏸️  Rate limited and --rate-limit-sleep is 0; pausing batch without consuming retry budget."
+        terminal_failure_recorded=true
+        break
+      fi
+      retries=$((retries + 1))
+      local retry_completed_at
+      retry_completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      update_state_retrying "$id" "$url" "rate_limited" "$started_at" "$retry_completed_at" "$report_num" "-" "rate-limit; retrying after ${RATE_LIMIT_SLEEP}s" "$retries"
+      echo "    ⏳ Rate limited (attempt $retries/$MAX_RETRIES). Waiting ${RATE_LIMIT_SLEEP}s before retry..."
+      sleep "$RATE_LIMIT_SLEEP"
+      continue
+    fi
 
     if [[ $exit_code -eq 0 ]]; then
       break
@@ -962,29 +1025,6 @@ process_offer() {
         ;;
     esac
 
-    if is_session_limit_log "$log_file"; then
-      mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
-      echo "    ⏸️  Session/rate limit reached; pausing batch without consuming retry budget."
-      terminal_failure_recorded=true
-      break
-    fi
-
-    if is_rate_limit_log "$log_file" && (( retries < MAX_RETRIES )); then
-      if (( RATE_LIMIT_SLEEP <= 0 )); then
-        mark_paused_rate_limit "$id" "$url" "$started_at" "$report_num" "$retries" "$log_file"
-        echo "    ⏸️  Rate limited and --rate-limit-sleep is 0; pausing batch without consuming retry budget."
-        terminal_failure_recorded=true
-        break
-      fi
-      retries=$((retries + 1))
-      local retry_completed_at
-      retry_completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-      update_state_retrying "$id" "$url" "rate_limited" "$started_at" "$retry_completed_at" "$report_num" "-" "rate-limit; retrying after ${RATE_LIMIT_SLEEP}s" "$retries"
-      echo "    ⏳ Rate limited (attempt $retries/$MAX_RETRIES). Waiting ${RATE_LIMIT_SLEEP}s before retry..."
-      sleep "$RATE_LIMIT_SLEEP"
-      continue
-    fi
-
     break
   done
 
@@ -995,7 +1035,50 @@ process_offer() {
   local completed_at
   completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-  if [[ $exit_code -eq 0 ]]; then
+  # Detect the worker's own hard-stop JSON fence: some prompts (e.g. dead
+  # URL / empty JD) correctly refuse to score and emit
+  # {"status": "failed", ...} while still exiting 0. Treat that as a real
+  # failure so it retries/surfaces instead of being recorded "completed"
+  # with a dash score and no report file (silently invisible in the
+  # pipeline once max-retries suppresses it from future runs).
+  local worker_reported_failed=false
+  if grep -q '"status"[[:space:]]*:[[:space:]]*"failed"' "$log_file" 2>/dev/null; then
+    worker_reported_failed=true
+  fi
+
+  # Verify the worker's claimed report file actually exists on disk. Two
+  # failure modes observed in practice both exit 0 with no "status":"failed"
+  # string, so neither is caught by the check above: (1) the model narrates
+  # a full success summary — including a specific reports/NNNN-*.md path —
+  # that it never actually wrote (a file-write hallucination); (2) a garbled/
+  # truncated response ("Model generated invalid tool call: shell") that
+  # never reaches the JSON fence at all, leaving no score and no file. Both
+  # were previously recorded "completed" with a dash score, silently
+  # dropping the offer from the pipeline. A genuinely successful run always
+  # writes reports/${report_num}-*.md regardless of score (SKIP recommendations
+  # get a report too) — so require that file to exist before trusting the log.
+  # A brief settle-retry guards against a write-then-stat visibility race: a
+  # worker process can exit (and our exit_code capture happen) a beat before
+  # its last file write is visible to a fresh glob in this shell — observed
+  # in practice discarding a fully complete, valid 95K-token report as a
+  # false "missing" only seconds after the worker's own process exited. A
+  # genuine hallucination/failure never produces the file even after waiting,
+  # so this retry costs real hallucinations nothing while saving real ones.
+  local worker_report_missing=false
+  if [[ -n "$report_num" && "$report_num" != "-" ]]; then
+    local report_glob=("$REPORTS_DIR/${report_num}-"*.md)
+    local settle_attempt=0
+    while [[ ! -f "${report_glob[0]}" && $settle_attempt -lt 3 ]]; do
+      sleep 1
+      report_glob=("$REPORTS_DIR/${report_num}-"*.md)
+      settle_attempt=$((settle_attempt + 1))
+    done
+    if [[ ! -f "${report_glob[0]}" ]]; then
+      worker_report_missing=true
+    fi
+  fi
+
+  if [[ $exit_code -eq 0 && "$worker_reported_failed" == "false" && "$worker_report_missing" == "false" ]]; then
     # Try to extract score from worker output
     local score="-"
     local score_match
@@ -1206,10 +1289,21 @@ main() {
 
   resolve_worker_model
 
-  # For Hermes, we use explicit provider and model from worker_args
+  # For Hermes, default to the nous pool's free poolside model unless the
+  # caller explicitly overrode --model and/or --provider (e.g. to route
+  # through OpenRouter: --provider openrouter --model z-ai/glm-5.2:free).
+  # RESOLVED_SPEND_TIER is cosmetic here (shown in the run banner) and just
+  # mirrors whichever provider ends up in effect.
   if [[ "$CLI" == "hermes" ]]; then
-    RESOLVED_MODEL="poolside/laguna-xs-2.1:free"
-    RESOLVED_SPEND_TIER="nous"
+    if [[ -z "$MODEL" ]]; then
+      RESOLVED_MODEL="poolside/laguna-xs-2.1:free"
+    fi
+    if [[ -n "$PROVIDER" ]]; then
+      RESOLVED_HERMES_PROVIDER="$PROVIDER"
+    else
+      RESOLVED_HERMES_PROVIDER="nous"
+    fi
+    RESOLVED_SPEND_TIER="$RESOLVED_HERMES_PROVIDER"
   fi
 
   if [[ "$DRY_RUN" == "false" ]]; then
