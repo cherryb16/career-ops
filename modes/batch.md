@@ -140,6 +140,24 @@ The worker produces:
 3. Tracker line in `batch/tracker-additions/{id}.tsv`
 4. Result JSON via stdout
 
+### AGY Output Location
+
+AGI batch runs write output to an ephemeral scratch directory:
+- **Reports:** `/Users/mac_studio/.gemini/antigravity-cli/scratch/reports/`
+- **Tracker additions:** `/Users/mac_studio/.gemini/antigravity-cli/scratch/batch/tracker-additions/`
+
+**Pitfall:** The scratch directory is ephemeral. After a batch run completes, copy report files to the project `reports/` directory:
+```bash
+cp /Users/mac_studio/.gemini/antigravity-cli/scratch/reports/*.md reports/
+```
+
+### State File "failed" Status
+
+AGY runs may show `failed` in `batch-state.tsv` due to auth warning messages in the log, even when the evaluation completed successfully. Verify completion by checking the corresponding `.log` file for a JSON result block with `"status": "completed"`:
+```bash
+grep -A1 '"status"' batch/logs/2378-20.log
+```
+
 ## Error handling
 
 | Error | Recovery |
