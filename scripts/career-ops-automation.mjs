@@ -322,7 +322,35 @@ export async function cronWorkflow() {
     appendAtomic(workflowLog, `websearch error: ${output}\n`);
   }
   
-  // 3. Liveness sweep on pending pipeline entries
+  // 3. Explore cache refresh (feeds the read-only web dashboard)
+  appendAtomic(workflowLog, '=== EXPLORE CACHE REFRESH ===\n');
+  try {
+    // run-explore-scan.mjs is trigger-driven: the web's POST /api/explore writes
+    // data/explore-trigger.json. On the nightly run there is usually no pending
+    // web request, so seed a default trigger to keep the dashboard cache fresh.
+    const triggerFile = join(ROOT, 'data', 'explore-trigger.json');
+    if (!existsSync(triggerFile)) {
+      writeJson(triggerFile, {
+        requestedAt: new Date().toISOString(),
+        filters: { sinceDays: 7, ats: ['greenhouse', 'lever', 'ashby', 'workday'], limitPerAts: 150 },
+        requestedBy: 'cron',
+      });
+      appendAtomic(workflowLog, 'Seeded default explore trigger\n');
+    } else {
+      appendAtomic(workflowLog, 'Using pending web-requested explore trigger\n');
+    }
+    const exploreResult = execFileSync('node', ['scripts/run-explore-scan.mjs'], {
+      cwd: ROOT,
+      env: process.env,
+      encoding: 'utf8',
+      timeout: 2700000, // 45 min — a full ATS sweep took ~28 min on 600 companies
+    });
+    appendAtomic(workflowLog, exploreResult);
+  } catch (err) {
+    appendAtomic(workflowLog, `explore cache error: ${err.stdout || err.message}\n`);
+  }
+
+  // 4. Liveness sweep on pending pipeline entries
   appendAtomic(workflowLog, '=== LIVENESS SWEEP ===\n');
   try {
     const pipeline = readFileSync(PIPELINE_FILE, 'utf8');
@@ -357,7 +385,7 @@ export async function cronWorkflow() {
     appendAtomic(workflowLog, `liveness error: ${err.message}\n`);
   }
   
-  // 4. Reset non-terminal batch rows so retried jobs can run
+  // 5. Reset non-terminal batch rows so retried jobs can run
   appendAtomic(workflowLog, '=== RESET NON-TERMINAL ROWS ===\n');
   try {
     const stateFile = join(ROOT, 'batch', 'batch-state.tsv');
@@ -373,7 +401,7 @@ export async function cronWorkflow() {
     appendAtomic(workflowLog, `reset error: ${err.message}\n`);
   }
   
-  // 5. Batch evaluation
+  // 6. Batch evaluation
   appendAtomic(workflowLog, '=== BATCH EVALUATION ===\n');
   try {
     const batchResult = execFileSync('./batch/batch-runner.sh', ['--cli', 'agy', '--parallel', '2', '--limit', '30'], {
@@ -387,7 +415,7 @@ export async function cronWorkflow() {
     appendAtomic(workflowLog, `batch error: ${err.stdout || err.message}\n`);
   }
   
-  // 6. Merge tracker
+  // 7. Merge tracker
   appendAtomic(workflowLog, '=== MERGE TRACKER ===\n');
   try {
     const mergeResult = execFileSync('node', ['merge-tracker.mjs'], {
@@ -401,7 +429,7 @@ export async function cronWorkflow() {
     appendAtomic(workflowLog, `merge error: ${err.stdout || err.message}\n`);
   }
   
-  // 7. Reconcile pipeline
+  // 8. Reconcile pipeline
   appendAtomic(workflowLog, '=== RECONCILE PIPELINE ===\n');
   try {
     const reconcileResult = execFileSync('node', ['reconcile-pipeline.mjs'], {
@@ -415,7 +443,7 @@ export async function cronWorkflow() {
     appendAtomic(workflowLog, `reconcile error: ${err.stdout || err.message}\n`);
   }
   
-  // 8. Verify pipeline
+  // 9. Verify pipeline
   appendAtomic(workflowLog, '=== VERIFY PIPELINE ===\n');
   try {
     const verifyResult = execFileSync('node', ['verify-pipeline.mjs'], {
@@ -429,7 +457,7 @@ export async function cronWorkflow() {
     appendAtomic(workflowLog, `verify error: ${err.stdout || err.message}\n`);
   }
   
-  // 9. Notify
+  // 10. Notify
   appendAtomic(workflowLog, '=== NOTIFY ===\n');
   try {
     const stateFile = join(runDir, 'state.json');
