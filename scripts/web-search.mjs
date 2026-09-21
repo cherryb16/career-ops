@@ -30,6 +30,13 @@ const HERMES_BIN = resolve(process.env.HERMES_BIN || join(process.env.HOME || '/
 const COMPANY_TIMEOUT = 300000; // 5 minutes per attempt
 const MAX_RETRIES = 2; // Max retries per company
 
+// Overall wall-clock budget for the whole sweep. The cron step that calls this
+// script (career-ops-automation.mjs, WEBSEARCH EXECUTION) kills it at 30 min,
+// which silently truncated every run around company ~20-30 of 76 and discarded
+// the partial results. Finish cleanly under that ceiling instead, reporting
+// what was actually searched.
+const TOTAL_BUDGET_MS = Number(process.env.WEBSEARCH_BUDGET_MS || 25 * 60 * 1000);
+
 // Model pool — tried in order on retry
 const MODEL_POOL = [
   { model: 'openai-codex/gpt-4o-mini', provider: 'openai-codex' },
@@ -87,7 +94,16 @@ If no relevant postings are found, return \`"postings_found": 0\` with an empty 
 }
 
 /**
- * Search using Hermes CLI with browser toolset
+ * Search using Hermes CLI with web research toolset
+ *
+ * NOTE: `--toolsets browser` looks right but is wrong here. In a headless
+ * `--oneshot` run the browser tools that actually navigate (browser_navigate /
+ * browser_snapshot) need a live CDP browser session; without one the agent is
+ * left holding only the browser_vault_* credential helpers and replies "I don't
+ * have the ability to browse web pages", which parsePostings() reads as zero
+ * results. Every company scored 0 postings on every cron run because of this.
+ * `web` (web_search + web_extract) is the headless-safe toolset and returns
+ * real postings.
  */
 function searchWithHermes(company, careersUrl, model, provider) {
   const prompt = buildPrompt(company, careersUrl);
@@ -95,7 +111,7 @@ function searchWithHermes(company, careersUrl, model, provider) {
   const args = [
     'chat',
     '--model', model,
-    '--toolsets', 'browser',
+    '--toolsets', 'web',
     '--oneshot',
     '-Q',
     '--run-budget', '180',
@@ -280,7 +296,17 @@ async function main() {
   const outputDir = join(ROOT, 'data', 'websearch-results');
   mkdirSync(outputDir, { recursive: true });
 
+  const startedAt = Date.now();
+  let budgetExhausted = false;
+
   for (let i = 0; i < toProcess.length; i++) {
+    const elapsed = Date.now() - startedAt;
+    if (elapsed > TOTAL_BUDGET_MS) {
+      budgetExhausted = true;
+      console.log(`\nBudget of ${Math.round(TOTAL_BUDGET_MS / 60000)} min reached after ${i} companies — stopping cleanly so partial results are saved.`);
+      break;
+    }
+
     const company = toProcess[i];
     console.log(`[${i + 1}/${toProcess.length}] ${company.name}...`);
     const result = searchCompanyWithRetry(company.name, company.careers_url);
@@ -316,7 +342,7 @@ async function main() {
   }
 
   console.log(`\n=== Web Search Complete ===`);
-  console.log(`Companies searched: ${results.length}`);
+  console.log(`Companies searched: ${results.length}${budgetExhausted ? ` of ${toProcess.length} (budget reached)` : ''}`);
   console.log(`Successful: ${successCount}, Failed: ${failCount}, Retried: ${retryCount}`);
   console.log(`Total postings found: ${totalPostings}`);
   console.log(`Model usage: ${Object.entries(modelCounts).map(([k,v]) => `${k}=${v}`).join(', ')}`);
