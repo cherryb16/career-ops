@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Bell, CircleHelp, Sparkles, ArrowRight } from "lucide-react";
+import { Bell, CircleHelp, Sparkles, ArrowRight, RefreshCw, Clock, Compass } from "lucide-react";
 import { instrumentSerif } from "@/lib/fonts";
 import { HeroGlow } from "@/components/hero-glow";
 import type { Application, InboxJob } from "@/lib/career-ops";
@@ -30,6 +30,13 @@ export function TodayDashboard({
   const [followups, setFollowups] = useState<FollowUp[]>([]);
   const [overdue, setOverdue] = useState(0);
   const [fresh, setFresh] = useState<DiscoveredOffer[]>([]);
+  // Background scan status
+  const [bgScanStatus, setBgScanStatus] = useState<{
+    lastRun: string | null;
+    lastRunStatus: "success" | "error" | "running";
+    lastRunOutput: string;
+    error: string | null;
+  } | null>(null);
   const router = useRouter();
   const dateLabel = useMemo(() => new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" }), []);
 
@@ -44,6 +51,11 @@ export function TodayDashboard({
     fetch("/api/whats-new")
       .then((r) => r.json())
       .then((d) => setFresh(Array.isArray(d.offers) ? d.offers : []))
+      .catch(() => {});
+    // Also fetch background scan status
+    fetch("/api/background-status")
+      .then((r) => r.json())
+      .then((d) => setBgScanStatus(d?.scan || null))
       .catch(() => {});
   }, []);
 
@@ -69,6 +81,18 @@ export function TodayDashboard({
   const newThisWeek = fresh.length;
   const allClear = newThisWeek === 0 && overdue === 0 && awaiting.length === 0;
   const inboxUrls = useMemo(() => new Set(inbox.map((j) => j.url)), [inbox]);
+
+  // Format background scan status for display
+  const bgLastRun = bgScanStatus?.lastRun ? new Date(bgScanStatus.lastRun).toLocaleString() : "Never";
+  const bgStatusIcon = bgScanStatus?.lastRunStatus === "running" ? (
+    <RefreshCw className="size-3 animate-spin text-brand" />
+  ) : bgScanStatus?.lastRunStatus === "success" ? (
+    <Sparkles className="size-3 text-emerald-500" />
+  ) : bgScanStatus?.lastRunStatus === "error" ? (
+    <Clock className="size-3 text-amber-500" />
+  ) : (
+    <Clock className="size-3 text-muted" />
+  );
 
   return (
     <div className="mx-auto max-w-5xl px-6 py-10 max-sm:pb-24">
@@ -113,6 +137,25 @@ export function TodayDashboard({
           {inBetween && <QuickEvaluate />}
         </div>
       </section>
+
+      {/* Background Scan Status Bar */}
+      <div className="mb-6 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface/30 px-3 py-2 text-xs">
+        <span className="flex items-center gap-1.5 text-muted">
+          <Compass className="size-3.5" /> ATS Scan:
+        </span>
+        <span className="flex items-center gap-1">
+          {bgStatusIcon}
+          <span className="font-mono">
+            {bgScanStatus?.lastRunStatus === "running"
+              ? "Running in background…"
+              : bgScanStatus?.lastRunStatus === "success"
+              ? `Last: ${bgLastRun} · ${bgScanStatus.lastRunOutput || "done"}`
+              : bgScanStatus?.lastRunStatus === "error"
+              ? `Error: ${bgScanStatus.error || "unknown"}`
+              : "Never run"}
+          </span>
+        </span>
+      </div>
 
       {/* A. Follow-ups due (demand loop) */}
       {followups.length > 0 && (

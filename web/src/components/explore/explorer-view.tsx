@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Compass, ChevronDown, RotateCcw, AlertTriangle, Sparkles, Settings } from "lucide-react";
+import { Compass, ChevronDown, RotateCcw, AlertTriangle, Sparkles, Settings, RefreshCw, Clock } from "lucide-react";
 import Link from "next/link";
 import { cn } from "@/lib/cn";
 import { instrumentSerif } from "@/lib/fonts";
@@ -37,7 +37,30 @@ export function ExplorerView({
   appsSnapshot: Application[];
   rootExists: boolean;
 }) {
-  const { filters, setFilters, initFilters, phase, running, offers, discover, status, error, mode, setMode, aiIntent, setAiIntent, discoverAI, companiesScanned, companiesAvailable, capHit, droppedNoDate, partial } = useExplore();
+  const {
+    filters,
+    setFilters,
+    initFilters,
+    phase,
+    running,
+    offers,
+    discover,
+    status,
+    error,
+    mode,
+    setMode,
+    aiIntent,
+    setAiIntent,
+    discoverAI,
+    companiesScanned,
+    companiesAvailable,
+    capHit,
+    droppedNoDate,
+    partial,
+    backgroundStatus,
+    refreshingBackground,
+    refreshBackgroundScan,
+  } = useExplore();
   const scanNote =
     companiesScanned > 0
       ? `Scanned ${companiesScanned.toLocaleString()}${companiesAvailable > companiesScanned ? ` of ${companiesAvailable.toLocaleString()}` : ""} compan${companiesScanned === 1 ? "y" : "ies"}${partial ? " · some sources were unreachable" : ""}.`
@@ -100,6 +123,19 @@ export function ExplorerView({
   const canDiscover = filters.ats.length > 0;
   const isResults = phase === "results";
 
+  // Format background scan status for display
+  const bgStatus = backgroundStatus;
+  const bgLastRun = bgStatus?.lastRun ? new Date(bgStatus.lastRun).toLocaleString() : "Never";
+  const bgStatusIcon = bgStatus?.lastRunStatus === "running" ? (
+    <RefreshCw className="size-3 animate-spin text-brand" />
+  ) : bgStatus?.lastRunStatus === "success" ? (
+    <Sparkles className="size-3 text-emerald-500" />
+  ) : bgStatus?.lastRunStatus === "error" ? (
+    <AlertTriangle className="size-3 text-amber-500" />
+  ) : (
+    <Clock className="size-3 text-muted" />
+  );
+
   return (
     <div className="mx-auto max-w-5xl px-5 py-8 md:px-8">
       <header className="mb-6">
@@ -122,9 +158,39 @@ export function ExplorerView({
         )}
       </header>
 
+      {/* Background Scan Status Bar */}
+      {!isAi && (
+        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface/30 px-3 py-2 text-xs">
+          <span className="flex items-center gap-1.5 text-muted">
+            <Compass className="size-3.5" /> ATS Scan:
+          </span>
+          <span className="flex items-center gap-1">
+            {bgStatusIcon}
+            <span className="font-mono">
+              {bgStatus?.lastRunStatus === "running"
+                ? "Running in background…"
+                : bgStatus?.lastRunStatus === "success"
+                ? `Last: ${bgLastRun} · ${bgStatus.lastRunOutput || "done"}`
+                : bgStatus?.lastRunStatus === "error"
+                ? `Error: ${bgStatus.error || "unknown"}`
+                : "Never run"}
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={() => refreshBackgroundScan()}
+            disabled={refreshingBackground || bgStatus?.lastRunStatus === "running"}
+            className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface/50 px-3 py-1.5 text-sm font-medium text-foreground transition-colors hover:border-brand/40 hover:text-brand disabled:opacity-50"
+          >
+            <RefreshCw className={cn("size-3.5", refreshingBackground || bgStatus?.lastRunStatus === "running" && "animate-spin")} />
+            {refreshingBackground || bgStatus?.lastRunStatus === "running" ? "Refreshing…" : "Refresh Now"}
+          </button>
+        </div>
+      )}
+
       {!rootExists && (
         <div className="mb-5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-300">
-          Your career-ops home isn’t set up yet — discovery needs a checkout with a profile to seed from.
+          Your career-ops home isn't set up yet — discovery needs a checkout with a profile to seed from.
         </div>
       )}
 
@@ -182,7 +248,7 @@ export function ExplorerView({
             <div className="mb-4 flex items-start gap-2.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3">
               <Sparkles className="mt-0.5 size-4 shrink-0 text-emerald-500" />
               <p className="text-[13px] leading-relaxed text-foreground">
-                These are live roles that match your CV. <span className="text-emerald-600 dark:text-emerald-400">Nothing here cost you a token.</span> Pick the one you&apos;re most curious about — Evaluate it and I&apos;ll tell you exactly how you score, and why.
+                These are live roles that match your CV. <span className="text-emerald-600 dark:text-emerald-400">Nothing here cost you a token.</span> Pick the one you're most curious about — Evaluate it and I'll tell you exactly how you score, and why.
               </p>
             </div>
           )}
@@ -288,9 +354,9 @@ function DegradedCard({
   // 0 results, but the scan was NOT a clean full search → never "all caught up".
   // Pick the most informative reason (authoritative when the scanner's --json mode
   // is available; otherwise the 0-companies fallback).
-  let title = "The scan ran, but couldn’t reach any sources.";
+  let title = "The scan ran, but couldn't reach any sources.";
   let body =
-    "The public ATS directories didn’t respond — usually a transient network hiccup or rate-limit, so nothing could be searched. This isn’t “all caught up”; a retry in a moment usually clears it.";
+    "The public ATS directories didn't respond — usually a transient network hiccup or rate-limit, so nothing could be searched. This isn't \"all caught up\"; a retry in a moment usually clears it.";
   if (companiesScanned > 0 && capHit) {
     title = "No matches in the slice we searched.";
     body = `The scan is capped, so it only searched ${companiesScanned.toLocaleString()}${companiesAvailable > companiesScanned ? ` of ${companiesAvailable.toLocaleString()}` : ""} companies — not the whole network. Raise scan depth (Refine search) or narrow your roles, then re-cast to look deeper.`;
@@ -299,7 +365,7 @@ function DegradedCard({
     body = `${droppedNoDate.toLocaleString()} posting${droppedNoDate === 1 ? "" : "s"} matched but had no clear publish date, so the freshness filter dropped them. Widening the time window often brings dated equivalents back.`;
   } else if (companiesScanned > 0 && partial) {
     title = "Some job boards were unreachable.";
-    body = `The scan searched ${companiesScanned.toLocaleString()} companies, but one or more sources didn’t respond — so this is a partial result, not “all caught up”. A retry usually clears it.`;
+    body = `The scan searched ${companiesScanned.toLocaleString()} companies, but one or more sources didn't respond — so this is a partial result, not "all caught up". A retry usually clears it.`;
   }
   return (
     <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-5 text-center">
@@ -358,7 +424,7 @@ function FailedCard({ msg, onRetry }: { msg: string; onRetry: () => void }) {
   return (
     <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-5 text-center">
       <AlertTriangle className="mx-auto size-6 text-amber-500" />
-      <p className="mt-2 text-sm font-medium text-foreground">Couldn’t finish the search.</p>
+      <p className="mt-2 text-sm font-medium text-foreground">Couldn't finish the search.</p>
       <p className="mt-1 text-[13px] text-muted">{msg}</p>
       <button onClick={onRetry} className="mt-3 inline-flex items-center gap-1.5 rounded-md bg-brand-soft px-3 py-1.5 text-sm font-medium text-brand">
         <RotateCcw className="size-4" /> Try again

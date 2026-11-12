@@ -14692,13 +14692,21 @@ try {
   // Workers must be spawned with --strict-mcp-config so they don't inherit the
   // parent session's MCP servers (e.g. Playwright) and deadlock fighting over a
   // single browser when --parallel > 1 (issue #506).
-  const claudeArgsLine = batchRunner
+  // This fork builds the worker command in `worker_args` (multi-CLI: agy /
+  // claude / codex / hermes), where upstream used `claude_args`, and it now has
+  // more than one claude spawn (the evaluation worker plus the triage pass).
+  // So assert the property on EVERY claude spawn rather than the first match:
+  // `--permission-mode auto` identifies them, and comments are excluded.
+  const claudeSpawns = batchRunner
     .split('\n')
-    .find(l => l.includes('claude_args=('));
-  if (claudeArgsLine && claudeArgsLine.includes('--strict-mcp-config')) {
-    pass('batch workers spawn with --strict-mcp-config (no inherited MCP)');
+    .filter(l => l.includes('--permission-mode auto') && !l.trimStart().startsWith('#'));
+  const unguarded = claudeSpawns.filter(l => !l.includes('--strict-mcp-config'));
+  if (claudeSpawns.length > 0 && unguarded.length === 0) {
+    pass(`all ${claudeSpawns.length} claude spawn(s) use --strict-mcp-config (no inherited MCP)`);
+  } else if (claudeSpawns.length === 0) {
+    fail('found no claude spawn in batch-runner.sh — this check needs updating');
   } else {
-    fail('batch-runner.sh worker spawn missing --strict-mcp-config (issue #506 regression)');
+    fail(`batch-runner.sh has ${unguarded.length} claude spawn(s) missing --strict-mcp-config (issue #506 regression)`);
   }
 } catch (e) {
   fail(`Batch runner MCP isolation test crashed: ${e.message}`);

@@ -1,60 +1,95 @@
-import { NextRequest } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import fs from "node:fs";
-import { runDiscovery } from "@/lib/core/scan";
-import { rootScript } from "@/lib/career-ops";
+import path from "node:path";
+import { careerOpsRoot } from "@/lib/career-ops";
+import { readExploreCache, writeBackgroundStatus, readBackgroundStatus } from "@/lib/cache-helpers";
 import { parseExplorePatch, DEFAULT_FILTERS, type DiscoveredOffer, type ScanEvent } from "@/lib/explore";
 
-// Discovery is HTTP-bound across many ATS boards; give it room. It is FREE —
-// zero LLM tokens (the scanner only does HTTP + JSON, and --dry-run writes nothing).
 export const runtime = "nodejs";
-export const maxDuration = 300;
 export const dynamic = "force-dynamic";
 
+// GET: Return cached explore results instantly
+export async function GET(req: NextRequest) {
+  const cache = readExploreCache();
+  const status = readBackgroundStatus();
+
+  if (!cache) {
+    return NextResponse.json(
+      { offers: [], count: 0, cached: false, message: "No cached results yet. Run a scan first." },
+      { headers: { "Cache-Control": "no-cache" } }
+    );
+  }
+
+  // Apply current filters to cached offers (client can also filter)
+  const url = new URL(req.url);
+  const positive = url.searchParams.get("q")?.split(",").filter(Boolean) || [];
+  const ats = url.searchParams.get("ats")?.split(",").filter(Boolean) || [];
+  const sinceDays = Number(url.searchParams.get("since")) || 7;
+
+  let offers = cache.offers;
+  if (positive.length) {
+    offers = offers.filter((o) => positive.some((k) => o.title.toLowerCase().includes(k.toLowerCase())));
+  }
+  if (ats.length) {
+    offers = offers.filter((o) => ats.includes(o.ats));
+  }
+  if (sinceDays) {
+    const cutoff = Date.now() - sinceDays * 86_400_000;
+    offers = offers.filter((o) => o.postedAt && Date.parse(o.postedAt) >= cutoff);
+  }
+
+  return NextResponse.json(
+    {
+      offers,
+      count: offers.length,
+      cached: true,
+      generatedAt: cache.generatedAt,
+      summary: cache.summary,
+      backgroundStatus: status?.scan || null,
+    },
+    {
+      headers: {
+        "Cache-Control": "public, max-age=60, stale-while-revalidate=300",
+      },
+    }
+  );
+}
+
+// POST: Trigger a background scan (writes trigger file for cron to pick up)
 export async function POST(req: NextRequest) {
   let body: Record<string, unknown> = {};
   try {
     body = (await req.json()) as Record<string, unknown>;
-  } catch {
-    /* empty body → defaults */
-  }
+  } catch {}
 
   const filters = parseExplorePatch(body, DEFAULT_FILTERS);
 
-  // Guard: a data-only checkout (or pre-onboarding) has no scanner. Fail soft.
-  if (!fs.existsSync(rootScript("scan-ats-full"))) {
-    return Response.json(
-      { error: "The discovery scanner isn't available in this checkout yet." },
-      { status: 400 },
-    );
-  }
+  // Write trigger file for background cron to pick up
+  const triggerPath = path.join(careerOpsRoot(), "data", "explore-trigger.json");
+  const trigger = {
+    requestedAt: new Date().toISOString(),
+    filters,
+    requestedBy: "web",
+  };
 
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    async start(controller) {
-      const send = (obj: unknown) => {
-        try {
-          controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
-        } catch {
-          /* stream closed */
-        }
-      };
-      send({ kind: "start", ats: filters.ats, sinceDays: filters.sinceDays, limit: filters.limitPerAts, free: true } satisfies ScanEvent);
-      let offers: DiscoveredOffer[] = [];
-      try {
-        offers = await runDiscovery(filters, (e: ScanEvent) => send(e));
-      } catch (err) {
-        send({ kind: "error", message: err instanceof Error ? err.message : "discovery failed" } satisfies ScanEvent);
-      }
-      send({ kind: "done", count: offers.length, offers, cost: { tokens: 0, usd: 0 } } satisfies ScanEvent);
-      controller.close();
-    },
-  });
+  // Atomic write
+  const tmp = `${triggerPath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(trigger, null, 2), "utf8");
+  fs.renameSync(tmp, triggerPath);
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "application/x-ndjson; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      "X-Accel-Buffering": "no",
-    },
+  // Update background status to "running"
+  const status = readBackgroundStatus() || {
+    scan: { lastRun: null, lastRunStatus: "running", lastRunOutput: "", nextRun: null, error: null },
+    followup: { lastRun: null, lastRunStatus: "success", nextRun: null },
+    exploreCache: { generatedAt: null, source: "scan-ats-full" },
+  };
+  status.scan.lastRunStatus = "running";
+  status.scan.lastRun = new Date().toISOString();
+  writeBackgroundStatus(status);
+
+  return NextResponse.json({
+    ok: true,
+    message: "Scan triggered. Background job will pick it up.",
+    trigger: trigger.requestedAt,
   });
 }

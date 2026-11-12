@@ -1,111 +1,173 @@
-// tests/batch-runner-score-delimiter.test.mjs — the worker payload is split on a
-// delimiter that preserves empty fields.
+// tests/batch-runner-score-delimiter.test.mjs — how a worker's score reaches
+// the tracker.
 //
-// THE BUG THIS PINS
+// FORK DIVERGENCE (why this file was rewritten)
 //
-// batch-runner.sh serialises the worker's final JSON into three fields and reads
-// them back with `read -r parsed_status parsed_error parsed_score`. When those
-// fields were joined and split on TAB, the common path broke:
+// Upstream serialises the worker's final JSON into three fields and reads them
+// back with `IFS=$'<D>' read -r parsed_status parsed_error parsed_score`. That
+// design has a sharp edge: if the delimiter is IFS *whitespace* (tab), bash
+// collapses runs of it and drops empty fields, so a successful worker with an
+// empty `error` shifts the score out of its variable and EVERY offer records
+// "-" — silently, with exit 0 and a real report on disk.
 //
-//   a successful worker has status="completed", error EMPTY, score=3.4
-//   emitted:  completed \t \t 3.4
+// This fork does not use that mechanism at all (`parsed_status` appears zero
+// times). It extracts the score directly from the worker log with sed. So the
+// delimiter-collapse bug is structurally impossible here, and the old test's
+// emitter/reader regexes could never match — it reported a failure against a
+// runner that was fine.
 //
-// Tab is IFS *whitespace*, so bash collapses runs of it and strips leading and
-// trailing occurrences. The two tabs around the empty `error` collapse into one:
-//
-//   parsed_status="completed"  parsed_error="3.4"  parsed_score=""
-//
-// The `elif [[ -n "$parsed_score" ]]` branch then never fires, and EVERY
-// successful offer records score "-".
-//
-// It is silent and self-consistent: exit code 0, status `completed`, a real
-// report on disk, and a score column that is uniformly useless. Nothing in the
-// run summary shows it.
-//
-// This test extracts the REAL emitter out of batch/batch-runner.sh and runs it,
-// rather than restating it, so the two cannot drift apart.
-import { pass, fail, rmSync, getBash } from './helpers.mjs';
-import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+// WHAT STILL MATTERS is the outcome the old test protected: a successful worker
+// must record its REAL score, never "-". The extractor is pulled out of
+// batch-runner.sh and run against realistic logs so the two cannot drift.
+import { pass, fail, getBash, ROOT } from "./helpers.mjs";
+import { execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const SRC = readFileSync(join(ROOT, 'batch/batch-runner.sh'), 'utf-8').replace(/\r\n/g, '\n');
+const SRC = readFileSync(join(ROOT, "batch/batch-runner.sh"), "utf-8").replace(
+  /\r\n/g,
+  "\n",
+);
 
-console.log('\nbatch-runner.sh — worker payload delimiter');
+console.log("\nbatch-runner.sh — worker score extraction");
 
-// --- the two halves must agree -------------------------------------------
-// Emitter: the node -e program's `process.stdout.write(status + <D> + error ...)`
-const emit = SRC.match(/process\.stdout\.write\(status \+ "([^"]+)" \+ error \+ "([^"]+)" \+ score\)/);
-// Reader: `IFS=$'<D>' read -r parsed_status parsed_error parsed_score`
-const read = SRC.match(/IFS=\$'([^']+)' read -r parsed_status parsed_error parsed_score/);
+// ── static ──────────────────────────────────────────────────────────────────
 
-if (!emit) {
-  fail('could not find the worker-payload emitter in batch/batch-runner.sh — this test needs updating');
-} else if (!read) {
-  fail('could not find the worker-payload reader in batch/batch-runner.sh — this test needs updating');
+// Document the divergence as an assertion: if someone later ports upstream's
+// delimiter split into this fork, the whitespace-collapse bug comes with it and
+// this test must be revisited rather than silently passing.
+if (!/parsed_status/.test(SRC)) {
+  pass(
+    "no IFS-delimited payload split present, so empty fields cannot collapse the score",
+  );
 } else {
-  if (emit[1] === emit[2] && emit[1] === read[1]) {
-    pass(`emitter and reader use the same delimiter (${JSON.stringify(read[1])})`);
-  } else {
-    fail(`delimiter mismatch: emitter ${JSON.stringify(emit[1])}/${JSON.stringify(emit[2])}, reader ${JSON.stringify(read[1])}`);
-  }
-
-  // IFS whitespace (space, tab, newline) collapses runs and drops empty fields.
-  // Any of the three reintroduces the bug regardless of how the code reads.
-  if (!/^\\?[tn]$/.test(read[1]) && read[1] !== ' ') {
-    pass('the delimiter is not IFS whitespace, so empty fields survive the split');
-  } else {
-    fail(`delimiter ${JSON.stringify(read[1])} is IFS whitespace — empty fields collapse and score is lost`);
-  }
+  fail(
+    "an upstream-style delimiter split appeared — re-check the IFS-whitespace bug (empty error field eats the score)",
+  );
 }
 
-// --- end to end, using the real emitter ----------------------------------
-// A successful worker: error is empty and score is present. That is the exact
-// shape that broke, and the only one worth asserting.
-if (emit && read) {
-  const nodeProg = SRC.match(/parsed=\$\(printf '%s' "\$worker_result_json" \| node -e '([\s\S]*?)'\s*2>\/dev\/null/);
-  if (!nodeProg) {
-    fail('could not extract the node -e payload parser from batch-runner.sh');
-  } else {
-    const work = mkdtempSync(join(tmpdir(), 'cops-delim-'));
-    try {
-      const script = join(work, 'check.sh');
-      writeFileSync(script, [
-        '#!/usr/bin/env bash',
-        `worker_result_json='{"status":"completed","error":null,"score":3.4}'`,
-        `parsed=$(printf '%s' "$worker_result_json" | node -e '${nodeProg[1]}' 2>/dev/null || true)`,
-        `IFS=$'${read[1]}' read -r parsed_status parsed_error parsed_score <<< "$parsed"`,
+const extractorLine = (() => {
+  const m = SRC.match(/^\s*score_match=\$\((.*)\)$/m);
+  return m ? m[1] : null;
+})();
+
+if (extractorLine) {
+  pass("found the score extractor");
+} else {
+  fail("could not find the score_match extractor — this test needs updating");
+}
+
+const failedDetector =
+  /grep -q '"status"\[\[:space:\]\]\*:\[\[:space:\]\]\*"failed"'/.test(SRC) ||
+  /"status"\[\[:space:\]\]\*:\[\[:space:\]\]\*"failed"/.test(SRC);
+if (failedDetector) {
+  pass(
+    'a worker-reported "status":"failed" is detected before any score is trusted',
+  );
+} else {
+  fail(
+    "no worker-reported-failure detection — a refusing worker would be recorded completed",
+  );
+}
+
+// ── behavioural: run the real extractor against realistic logs ──────────────
+
+if (extractorLine) {
+  const work = mkdtempSync(join(tmpdir(), "co-score-"));
+  try {
+    const scriptPath = join(work, "extract.sh");
+    // Mirrors process_offer: extract, then fall back to "-" when nothing matched.
+    writeFileSync(
+      scriptPath,
+      [
+        "#!/usr/bin/env bash",
+        "set -uo pipefail",
+        'log_file="$1"',
         'score="-"',
-        'if [[ "$parsed_status" == "failed" ]]; then :',
-        'elif [[ -n "$parsed_score" ]]; then score="$parsed_score"; fi',
-        'printf "%s|%s|%s\\n" "$parsed_status" "$parsed_error" "$score"',
-      ].join('\n'));
+        'score_match=""',
+        `score_match=$(${extractorLine})`,
+        'if [[ -n "$score_match" ]]; then score="$score_match"; fi',
+        'printf "%s\\n" "$score"',
+      ].join("\n"),
+    );
 
-      const out = execFileSync(getBash(), [script], { encoding: 'utf-8', timeout: 30000 }).trim();
-      const [status, error, score] = out.split('|');
+    const extract = (log) => {
+      const f = join(work, "worker.log");
+      writeFileSync(f, log);
+      return execFileSync(getBash(), [scriptPath, f], {
+        encoding: "utf-8",
+        timeout: 30000,
+      }).trim();
+    };
 
-      if (score === '3.4') {
-        pass('a successful worker records its real score (not "-")');
+    const FINAL_JSON = (score, err = "null") =>
+      `{"status":"completed","id":"12","report_num":"042","company":"Acme",` +
+      `"role":"Analyst","score":${score},"legitimacy":"High Confidence",` +
+      `"pdf":null,"report":"reports/042-acme.md","error":${err}}`;
+
+    const cases = [
+      {
+        label: 'a successful worker records its real score, not "-"',
+        log: `Reading cv.md...\nWriting report...\n\`\`\`json\n${FINAL_JSON("3.4")}\n\`\`\`\n`,
+        expect: "3.4",
+      },
+      {
+        label: "an empty/null error field does not swallow the score",
+        log: `${FINAL_JSON("2.1", "null")}\n`,
+        expect: "2.1",
+      },
+      {
+        label: "a two-decimal score survives intact",
+        log: `${FINAL_JSON("4.25")}\n`,
+        expect: "4.25",
+      },
+      {
+        label: "an integer score is extracted",
+        log: `${FINAL_JSON("5")}\n`,
+        expect: "5",
+      },
+      {
+        label: "extra whitespace after the colon is tolerated",
+        log: '{"status":"completed","score":   3.9 }\n',
+        expect: "3.9",
+      },
+      {
+        label: 'a log with no score at all falls back to "-"',
+        log: "The worker crashed before emitting JSON.\n",
+        expect: "-",
+      },
+      {
+        // The prompt template ships `"score": {score_num}` as a placeholder.
+        // It must not be mistaken for a real score.
+        label: "the prompt template placeholder is not read as a score",
+        log:
+          'Template says "score": {score_num} and I will fill it in.\n' +
+          `\`\`\`json\n${FINAL_JSON("3.0")}\n\`\`\`\n`,
+        expect: "3.0",
+      },
+      {
+        // THE CONTRACT: batch-prompt.md Step 6 requires the final JSON payload
+        // to be the worker's last output. If narration earlier in the log
+        // mentions a score, the FINAL payload is still the authoritative one.
+        label: "the FINAL json wins when narration mentions an earlier score",
+        log:
+          'Draft thinking: maybe "score": 1.2 for this one?\n' +
+          "On reflection the comp band is stronger.\n" +
+          `\`\`\`json\n${FINAL_JSON("4.2")}\n\`\`\`\n`,
+        expect: "4.2",
+      },
+    ];
+
+    for (const c of cases) {
+      const got = extract(c.log);
+      if (got === c.expect) {
+        pass(`${c.label} → ${got}`);
       } else {
-        fail(`score was recorded as "${score}" instead of 3.4 — the empty error field collapsed the split`);
+        fail(`${c.label}: expected ${c.expect}, got ${got}`);
       }
-
-      if (error === '') {
-        pass('the empty error field stays empty rather than absorbing the score');
-      } else {
-        fail(`error absorbed the next field: "${error}"`);
-      }
-
-      if (status === 'completed') {
-        pass('status is still parsed correctly');
-      } else {
-        fail(`status parsed as "${status}"`);
-      }
-    } finally {
-      rmSync(work, { recursive: true, force: true });
     }
+  } finally {
+    rmSync(work, { recursive: true, force: true });
   }
 }

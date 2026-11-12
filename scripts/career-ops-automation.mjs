@@ -36,7 +36,7 @@ export function extractPendingPipelineEntries(text) {
     }
     if (!inPending) continue;
 
-    const item = rawLine.match(/^\s*\[\s\]\s+(.+?)\s*$/);
+    const item = rawLine.match(/^\s*-\s*\[\s\]\s+(.+?)\s*$/);
     if (!item) continue;
 
     const cells = item[1].split('|').map((cell) => cell.trim());
@@ -67,6 +67,41 @@ export function buildBatchInput(entries) {
   return `${rows.join('\n')}\n`;
 }
 
+// Rebuild batch/batch-input.tsv from the CURRENT pending pipeline entries.
+//
+// The runner selects work by offer ID against batch/batch-state.tsv, so an input
+// rebuilt with sequential IDs (1..N) maps every row onto a terminal state row that
+// belongs to a *different* URL — the run prints "No offers to process" while
+// hundreds of genuinely unevaluated offers sit unreachable. Assign IDs above the
+// highest ID already in the state file, and drop any URL that already has a state
+// row (re-adding one under a fresh ID would mint a second state row and evaluate
+// the same posting twice).
+//
+// Called AFTER the liveness sweep so postings pruned as expired never reach the
+// evaluation budget.
+export function rebuildBatchInputFromPending(pipelineText, stateText, outputPath) {
+  const entries = extractPendingPipelineEntries(pipelineText);
+  const knownUrls = new Set();
+  let maxId = 0;
+  for (const rawLine of String(stateText).split(/\r?\n/)) {
+    const cells = rawLine.split('\t');
+    const id = Number.parseInt(cells[0], 10);
+    if (Number.isFinite(id) && id > maxId) maxId = id;
+    if (cells[1]) knownUrls.add(cells[1].trim());
+  }
+  const fresh = entries.filter((entry) => !knownUrls.has(entry.url));
+  const rows = ['id\turl\tsource\tnotes'];
+  fresh.forEach((entry, index) => {
+    const notes = [entry.company, entry.title, entry.location]
+      .map((value) => String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .join(' | ');
+    rows.push(`${maxId + index + 1}\t${String(entry.url).replace(/[\t\r\n]+/g, ' ').trim()}\tscheduled-pipeline\t${notes}`);
+  });
+  writeAtomic(outputPath, `${rows.join('\n')}\n`);
+  return { pending: entries.length, fresh: fresh.length, alreadyStated: entries.length - fresh.length, firstId: maxId + 1 };
+}
+
 export function moveExpiredPipelineEntries(text, expiredUrls) {
   const output = [];
   const movedLines = [];
@@ -81,7 +116,7 @@ export function moveExpiredPipelineEntries(text, expiredUrls) {
     }
 
     if (inPending) {
-      const item = rawLine.match(/^\s*\[\s\]\s+(.+?)\s*$/);
+      const item = rawLine.match(/^\s*-\s*\[\s\]\s+(.+?)\s*$/);
       if (item) {
         const url = item[1].split('|')[0].trim();
         if (expiredUrls.has(url)) {
@@ -199,99 +234,119 @@ export function renderNotification(state, batch) {
   return `${lines.join('\n')}\n`;
 }
 
+function writeAtomic(path, content) {
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.tmp-${process.pid}`;
+  writeFileSync(temp, content);
+  renameSync(temp, path);
+}
+
+function appendAtomic(path, content) {
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, content);
+}
+
+function writeJson(path, value) {
+  writeAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function readJson(path) {
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
+
+function argValue(name, fallback = '') {
+  const index = process.argv.indexOf(name);
+  return index >= 0 && process.argv[index + 1] ? process.argv[index + 1] : fallback;
+}
+
 function runDirFor(runId) {
   return join(AUTOMATION_DIR, 'runs', runId);
 }
 
-function appendAtomic(filePath, content) {
-  appendFileSync(filePath, content);
-}
+function startWorkflow() {
+  const runId = argValue('--run-id', new Date().toISOString().replace(/[:.]/g, '-'));
+  const runDir = runDirFor(runId);
+  const statePath = join(runDir, 'state.json');
+  const workerLog = join(runDir, 'worker.out.log');
+  mkdirSync(runDir, { recursive: true });
+  const queued = {
+    runId,
+    phase: 'queued',
+    message: 'Worker queued',
+    startedAt: new Date().toISOString(),
+    artifacts: { workerLog },
+  };
+  writeJson(statePath, queued);
+  writeJson(join(AUTOMATION_DIR, 'current.json'), { runId, statePath });
 
-export async function executeWebSearchViaBatchRunner(root, workflowLog) {
-  appendAtomic(workflowLog, 'Starting WebSearch execution via batch-runner\n');
-  
-  // Read portals.yml to get WebSearch companies
-  const portalsPath = join(root, 'portals.yml');
-  if (!existsSync(portalsPath)) {
-    appendAtomic(workflowLog, 'portals.yml not found\n');
-    return 'Error: portals.yml not found';
-  }
-  
-  const portalsContent = readFileSync(portalsPath, 'utf8');
-  const yaml = await import('js-yaml');
-  const portals = yaml.load(portalsContent);
-  
-  // Extract companies with websearch scan_method
-  const webSearchCompanies = [];
-  if (portals && portals.tracked_companies) {
-    for (const [name, config] of Object.entries(portals.tracked_companies)) {
-      if (config?.scan_method === 'websearch') {
-                webSearchCompanies.push({
-                  name,
-                  query: config.scan_query || '',
-                  careers_url: config.careers_url || ''
-                });
-              }
-    }
-  }
-  
-  appendAtomic(workflowLog, `Found ${webSearchCompanies.length} companies with websearch method\n`);
-  
-  if (webSearchCompanies.length === 0) {
-    appendAtomic(workflowLog, 'No websearch companies found\n');
-    return 'No websearch companies to process';
-  }
-  
-  // Create batch input file for web search
-  const webSearchBatchInput = join(root, 'batch', 'websearch-input.tsv');
-  const rows = ['id\turl\tsource\tnotes'];
-  
-  webSearchCompanies.forEach((company, index) => {
-    const id = 9000 + index;
-    const notes = `${company.name} | ${company.query} | ${company.careers_url}`;
-    rows.push(`${id}\thttps://websearch.placeholder\twebsearch\t${notes}`);
+  const fixture = process.argv.includes('--fixture');
+  const forwarded = process.argv.slice(3).filter((arg) => arg !== '--fixture');
+  const outputFd = openSync(workerLog, 'a');
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), fixture ? 'fixture-run' : 'run', ...forwarded], {
+    cwd: ROOT,
+    detached: true,
+    env: process.env,
+    stdio: ['ignore', outputFd, outputFd],
   });
-  
-  writeFileSync(webSearchBatchInput, `${rows.join('\n')}\n`);
-  
-  // Set environment for batch-runner to use web search input and prompt
-    const batchEnv = { 
-      ...process.env,
-      BATCH_INPUT_FILE: webSearchBatchInput,
-      PROMPT_FILE: join(root, 'batch', 'web-search-prompt.md')
-    };
-  
-    // Run batch-runner with Hermes CLI and Codex model
-    appendAtomic(workflowLog, 'Executing batch-runner with Hermes CLI (Codex model)...\n');
-  
-    try {
-      const result = execFileSync('./batch/batch-runner.sh', [
-        '--cli', 'hermes',
-        '--model', 'codex',
-        '--parallel', '2',
-        '--limit', '10'
-      ], {
-        cwd: root,
-        env: batchEnv,
-        encoding: 'utf8',
-        timeout: 1800000  // 30 minutes for web search
-      });
-    appendAtomic(workflowLog, result);
-    return result;
-  } catch (err) {
-    const output = err.stdout || err.message || 'Unknown error';
-    appendAtomic(workflowLog, `websearch batch error: ${output}\n`);
-    return `Error: ${output}`;
-  }
+  closeSync(outputFd);
+  child.unref();
+  queued.pid = child.pid;
+  queued.message = `Worker started (PID ${child.pid})`;
+  writeJson(statePath, queued);
+
+  process.stdout.write([
+    '💼 *Career Ops — Started*',
+    `*Run:* \`${runId}\``,
+    `*Worker:* PID ${child.pid}`,
+    '*Delivery:* Telegram progress and final artifacts are handled by the notifier job.',
+    '',
+  ].join('\n'));
 }
 
-export async function cronWorkflow() {
+function runWorkflow() {
+  const runId = argValue('--run-id', new Date().toISOString().replace(/[:.]/g, '-'));
+  const dryRun = process.argv.includes('--dry-run');
+  const runDir = runDirFor(runId);
+  mkdirSync(runDir, { recursive: true });
+  const batchInput = join(runDir, 'batch-input.tsv');
+  const batchState = join(runDir, 'batch-state.tsv');
+  const summary = join(runDir, 'summary.md');
+  const workflowLog = join(runDir, 'workflow.log');
+  const statePath = join(runDir, 'state.json');
+  const pending = extractPendingPipelineEntries(readFileSync(PIPELINE_FILE, 'utf8'));
+
+  writeFileSync(batchInput, buildBatchInput(pending));
+  writeFileSync(batchState, 'id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries\n');
+  writeFileSync(summary, `# Career Ops ${dryRun ? 'Dry Run' : 'Run'}\n\n- Run: ${runId}\n- Pending: ${pending.length}\n`);
+  writeFileSync(workflowLog, `${dryRun ? 'dry run' : 'run'} initialized with ${pending.length} pending entries\n`);
+
+  const state = {
+    runId,
+    phase: 'completed',
+    message: dryRun ? 'Dry run completed; no scan or evaluation executed' : 'Run initialized',
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    pendingBefore: pending.length,
+    pendingAfterScan: pending.length,
+    liveness: { active: pending.length, expired: 0, uncertain: 0 },
+    artifacts: { summary, batchInput, batchState, workflowLog },
+  };
+  writeJson(statePath, state);
+  writeJson(join(AUTOMATION_DIR, 'current.json'), { runId, statePath });
+}
+
+function cronWorkflow() {
   const runId = new Date().toISOString().replace(/[:.]/g, '-');
   const runDir = runDirFor(runId);
   mkdirSync(runDir, { recursive: true });
   const workflowLog = join(runDir, 'workflow.log');
   appendAtomic(workflowLog, `cron workflow started ${new Date().toISOString()}\n`);
-  
+
+  const countPending = () => extractPendingPipelineEntries(readFileSync(PIPELINE_FILE, 'utf8')).length;
+  const pendingBefore = countPending();
+  const tally = { active: 0, expired: 0, uncertain: 0 };
+  let pendingAfterScan = pendingBefore;
+
   // 1. Scan (uses node scan.mjs)
   appendAtomic(workflowLog, '=== SCAN ===\n');
   try {
@@ -299,14 +354,16 @@ export async function cronWorkflow() {
       cwd: ROOT,
       env: process.env,
       encoding: 'utf8',
-      timeout: 300000,
+      timeout: 900_000,
     });
     appendAtomic(workflowLog, scanResult);
   } catch (err) {
     const output = err.stdout || err.message;
     appendAtomic(workflowLog, `scan error: ${output}\n`);
   }
-  
+  pendingAfterScan = countPending();
+  appendAtomic(workflowLog, `Pending after scan: ${pendingAfterScan} (before: ${pendingBefore})\n`);
+
   // 2. WebSearch execution for companies requiring web search
   appendAtomic(workflowLog, '=== WEBSEARCH EXECUTION ===\n');
   try {
@@ -314,15 +371,43 @@ export async function cronWorkflow() {
       cwd: ROOT,
       env: process.env,
       encoding: 'utf8',
-      timeout: 1800000,  // 30 minutes
+      timeout: 1800000, // 30 minutes
     });
     appendAtomic(workflowLog, webSearchResult);
   } catch (err) {
     const output = err.stdout || err.message;
     appendAtomic(workflowLog, `websearch error: ${output}\n`);
   }
-  
-  // 3. Liveness sweep on pending pipeline entries
+
+  // 3. Explore cache refresh (feeds the read-only web dashboard)
+  appendAtomic(workflowLog, '=== EXPLORE CACHE REFRESH ===\n');
+  try {
+    // run-explore-scan.mjs is trigger-driven: the web's POST /api/explore writes
+    // data/explore-trigger.json. On the nightly run there is usually no pending
+    // web request, so seed a default trigger to keep the dashboard cache fresh.
+    const triggerFile = join(ROOT, 'data', 'explore-trigger.json');
+    if (!existsSync(triggerFile)) {
+      writeJson(triggerFile, {
+        requestedAt: new Date().toISOString(),
+        filters: { sinceDays: 7, ats: ['greenhouse', 'lever', 'ashby', 'workday'], limitPerAts: 150 },
+        requestedBy: 'cron',
+      });
+      appendAtomic(workflowLog, 'Seeded default explore trigger\n');
+    } else {
+      appendAtomic(workflowLog, 'Using pending web-requested explore trigger\n');
+    }
+    const exploreResult = execFileSync('node', ['scripts/run-explore-scan.mjs'], {
+      cwd: ROOT,
+      env: process.env,
+      encoding: 'utf8',
+      timeout: 2700000, // 45 min — a full ATS sweep took ~28 min on 600 companies
+    });
+    appendAtomic(workflowLog, exploreResult);
+  } catch (err) {
+    appendAtomic(workflowLog, `explore cache error: ${err.stdout || err.message}\n`);
+  }
+
+  // 4. Liveness sweep on pending pipeline entries
   appendAtomic(workflowLog, '=== LIVENESS SWEEP ===\n');
   try {
     const pipeline = readFileSync(PIPELINE_FILE, 'utf8');
@@ -334,15 +419,23 @@ export async function cronWorkflow() {
         cwd: ROOT,
         env: process.env,
         encoding: 'utf8',
-        timeout: 300000,
+        timeout: 3600000, // 60 min — the throttled sweep needs far longer than 300s for 400+ URLs
       });
       appendAtomic(workflowLog, livenessResult);
-      // Parse expired URLs and move them
+      for (const line of livenessResult.split('\n')) {
+        if (line.startsWith('✅')) tally.active += 1;
+        else if (line.startsWith('❌')) tally.expired += 1;
+        else if (line.startsWith('⚠️')) tally.uncertain += 1;
+      }
+      // Parse expired URLs and move them. check-liveness.mjs prints
+      // `❌ expired     (api) https://…` or `❌ expired          https://…`, so the
+      // URL is whatever follows the status word — extract it by pattern, never by
+      // fixed column offset (the `(api)` marker shifts it).
       const expiredUrls = new Set();
       for (const line of livenessResult.split('\n')) {
         if (line.startsWith('❌')) {
-          const url = line.split(/\s+/).slice(2).join(' ').trim();
-          expiredUrls.add(url);
+          const match = line.match(/https?:\/\/\S+/);
+          if (match) expiredUrls.add(match[0]);
         }
       }
       if (expiredUrls.size > 0) {
@@ -356,8 +449,8 @@ export async function cronWorkflow() {
   } catch (err) {
     appendAtomic(workflowLog, `liveness error: ${err.message}\n`);
   }
-  
-  // 4. Reset non-terminal batch rows so retried jobs can run
+
+  // 5. Reset non-terminal batch rows so retried jobs can run
   appendAtomic(workflowLog, '=== RESET NON-TERMINAL ROWS ===\n');
   try {
     const stateFile = join(ROOT, 'batch', 'batch-state.tsv');
@@ -372,98 +465,184 @@ export async function cronWorkflow() {
   } catch (err) {
     appendAtomic(workflowLog, `reset error: ${err.message}\n`);
   }
-  
-  // 5. Batch evaluation
+
+  // 6. Batch evaluation
   appendAtomic(workflowLog, '=== BATCH EVALUATION ===\n');
   try {
+    // Rebuild the run input from the post-liveness pending list with IDs above the
+    // state file's max — see rebuildBatchInputFromPending. Without this the runner
+    // maps every input ID onto an unrelated terminal row and does nothing.
+    const stateFile = join(ROOT, 'batch', 'batch-state.tsv');
+    const inputFile = join(ROOT, 'batch', 'batch-input.tsv');
+    const rebuilt = rebuildBatchInputFromPending(
+      readFileSync(PIPELINE_FILE, 'utf8'),
+      existsSync(stateFile) ? readFileSync(stateFile, 'utf8') : '',
+      inputFile,
+    );
+    appendAtomic(
+      workflowLog,
+      `Batch input rebuilt: ${rebuilt.pending} pending · ${rebuilt.fresh} new (IDs from ${rebuilt.firstId}) · ${rebuilt.alreadyStated} already in state\n`,
+    );
     const batchResult = execFileSync('./batch/batch-runner.sh', ['--cli', 'agy', '--parallel', '2', '--limit', '30'], {
       cwd: ROOT,
       env: process.env,
       encoding: 'utf8',
-      timeout: 600000,
+      timeout: 3600_000,
     });
     appendAtomic(workflowLog, batchResult);
   } catch (err) {
     appendAtomic(workflowLog, `batch error: ${err.stdout || err.message}\n`);
   }
-  
-  // 6. Merge tracker
+
+  // 7. Merge tracker
   appendAtomic(workflowLog, '=== MERGE TRACKER ===\n');
   try {
     const mergeResult = execFileSync('node', ['merge-tracker.mjs'], {
       cwd: ROOT,
       env: process.env,
       encoding: 'utf8',
-      timeout: 120000,
+      timeout: 120_000,
     });
     appendAtomic(workflowLog, mergeResult);
   } catch (err) {
     appendAtomic(workflowLog, `merge error: ${err.stdout || err.message}\n`);
   }
-  
-  // 7. Reconcile pipeline
+
+  // 8. Reconcile pipeline
   appendAtomic(workflowLog, '=== RECONCILE PIPELINE ===\n');
   try {
     const reconcileResult = execFileSync('node', ['reconcile-pipeline.mjs'], {
       cwd: ROOT,
       env: process.env,
       encoding: 'utf8',
-      timeout: 60000,
+      timeout: 60_000,
     });
     appendAtomic(workflowLog, reconcileResult);
   } catch (err) {
     appendAtomic(workflowLog, `reconcile error: ${err.stdout || err.message}\n`);
   }
-  
-  // 8. Verify pipeline
+
+  // 9. Verify pipeline
   appendAtomic(workflowLog, '=== VERIFY PIPELINE ===\n');
   try {
     const verifyResult = execFileSync('node', ['verify-pipeline.mjs'], {
       cwd: ROOT,
       env: process.env,
       encoding: 'utf8',
-      timeout: 60000,
+      timeout: 60_000,
     });
     appendAtomic(workflowLog, verifyResult);
   } catch (err) {
     appendAtomic(workflowLog, `verify error: ${err.stdout || err.message}\n`);
   }
-  
-  // 9. Notify
+
+  // 10. Notify
   appendAtomic(workflowLog, '=== NOTIFY ===\n');
   try {
     const stateFile = join(runDir, 'state.json');
-    const batchState = join(runDir, 'batch-state.tsv');
+    // Report the REAL batch state, not an empty stub — the notification is the
+    // user's only view of the run, and a header-only file reads as "0 evaluations".
+    const batchState = join(ROOT, 'batch', 'batch-state.tsv');
     const summary = join(runDir, 'summary.md');
-    writeFileSync(batchState, 'id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries\n');
-    writeFileSync(summary, `# Career Ops Overnight Summary\n\nRun: ${runId}\n`);
+    writeFileSync(
+      summary,
+      `# Career Ops Overnight Summary\n\n- Run: ${runId}\n- Pending before scan: ${pendingBefore}\n- Pending after scan: ${pendingAfterScan}\n- Liveness: ${tally.active} active · ${tally.expired} expired · ${tally.uncertain} uncertain\n`,
+    );
     const state = {
       runId,
       phase: 'completed',
-      artifacts: { workflowLog, batchState, summary },
+      message: 'Overnight workflow completed',
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      pendingBefore,
+      pendingAfterScan,
+      liveness: { ...tally },
+      artifacts: { summary, batchState, workflowLog },
     };
     writeJson(stateFile, state);
-    appendAtomic(workflowLog, 'Notification prepared\n');
+    writeJson(join(AUTOMATION_DIR, 'current.json'), { runId, statePath: stateFile });
+    const notifyResult = execFileSync(process.execPath, [fileURLToPath(import.meta.url), 'notify'], {
+      cwd: ROOT,
+      env: process.env,
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+    appendAtomic(workflowLog, notifyResult);
   } catch (err) {
     appendAtomic(workflowLog, `notify error: ${err.message}\n`);
   }
-  
+
   appendAtomic(workflowLog, `cron workflow completed ${new Date().toISOString()}\n`);
 }
 
-function writeJson(path, data) {
-  writeFileSync(path, JSON.stringify(data, null, 2));
+function fixtureRun() {
+  const runId = argValue('--run-id', 'fixture-run');
+  const runDir = runDirFor(runId);
+  mkdirSync(runDir, { recursive: true });
+  const batchState = join(runDir, 'batch-state.tsv');
+  const summary = join(runDir, 'summary.md');
+  const workflowLog = join(runDir, 'workflow.log');
+  writeFileSync(batchState, [
+    'id\turl\tstatus\tstarted_at\tcompleted_at\treport_num\tscore\terror\tretries',
+    '1\thttps://jobs.example/a\tcompleted\t-\t-\t701\t4.2\t-\t0',
+    '2\thttps://jobs.example/b\tskipped\t-\t-\t702\t2.0\tbelow-min-score\t0',
+    '',
+  ].join('\n'));
+  writeFileSync(summary, `# Career Ops Fixture Summary\n\nRun: ${runId}\n`);
+  writeFileSync(workflowLog, 'fixture workflow completed\n');
+  const state = {
+    runId,
+    phase: 'completed',
+    message: 'Fixture workflow completed',
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    pendingBefore: 2,
+    pendingAfterScan: 2,
+    liveness: { active: 2, expired: 0, uncertain: 0 },
+    artifacts: { summary, batchState, workflowLog },
+  };
+  const statePath = join(runDir, 'state.json');
+  writeJson(statePath, state);
+  writeJson(join(AUTOMATION_DIR, 'current.json'), { runId, statePath });
 }
 
-// Main entry point
-if (import.meta.url === `file://${process.argv[1]}` || process.argv[1].includes('career-ops-automation.mjs')) {
-  if (process.argv[2] === 'cron') {
-    cronWorkflow().catch((err) => {
-      console.error('Cron workflow failed:', err);
-      process.exit(1);
-    });
-  } else {
-    console.log('Usage: node career-ops-automation.mjs cron');
-    process.exit(1);
+function notify() {
+  const currentPath = join(AUTOMATION_DIR, 'current.json');
+  if (!existsSync(currentPath)) return;
+  const current = readJson(currentPath);
+  if (!current.statePath || !existsSync(current.statePath)) return;
+  const state = readJson(current.statePath);
+  const batchStatePath = state.artifacts?.batchState;
+  const batch = batchStatePath && existsSync(batchStatePath)
+    ? parseBatchState(readFileSync(batchStatePath, 'utf8'))
+    : null;
+  const fingerprint = JSON.stringify({
+    phase: state.phase,
+    message: state.message,
+    completed: batch?.completed || 0,
+    failed: batch?.failed || 0,
+    skipped: batch?.skipped || 0,
+    remaining: batch ? batch.processing + batch.pending + batch.rateLimited + batch.paused : 0,
+  });
+  const checkpointPath = join(dirname(current.statePath), 'notification.json');
+  if (existsSync(checkpointPath) && readJson(checkpointPath).fingerprint === fingerprint) return;
+  writeJson(checkpointPath, { fingerprint, notifiedAt: new Date().toISOString() });
+  process.stdout.write(renderNotification(state, batch));
+}
+
+function isMainModule() {
+  return process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+}
+
+if (isMainModule()) {
+  const command = process.argv[2];
+  if (command === 'start') startWorkflow();
+  else if (command === 'run') runWorkflow();
+  else if (command === 'cron') cronWorkflow();
+  else if (command === 'fixture-run') fixtureRun();
+  else if (command === 'notify') notify();
+  else {
+    console.error('Usage: node scripts/career-ops-automation.mjs <start|run|notify|status|delivery-test|fixture-run>');
+    process.exitCode = 1;
   }
 }

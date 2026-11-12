@@ -38,6 +38,13 @@ export type SourceState = {
   matches?: number;
   unreachable?: number;
 };
+export type BackgroundScanStatus = {
+  lastRun: string | null;
+  lastRunStatus: "success" | "error" | "running";
+  lastRunOutput: string;
+  nextRun: string | null;
+  error: string | null;
+};
 
 type ExploreCtx = {
   filters: ExploreFilters;
@@ -63,6 +70,10 @@ type ExploreCtx = {
   addToPipeline: (offers: DiscoveredOffer[]) => Promise<number>;
   applyPatch: (raw: Record<string, unknown>, opts?: { merge?: boolean; run?: boolean }) => void;
   reset: () => void;
+  // Background scan
+  backgroundStatus: BackgroundScanStatus | null;
+  refreshingBackground: boolean;
+  refreshBackgroundScan: () => Promise<void>;
   // ── AI search (modes/discover.md) ──
   mode: ExploreMode;
   setMode: (m: ExploreMode) => void;
@@ -127,6 +138,10 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
   const [aiIntent, setAiIntent] = useState("");
   const [aiTrace, setAiTrace] = useState<AiTraceChunk[]>([]);
   const [aiCost, setAiCost] = useState<AiCost>({ searches: 0, candidates: 0, fetches: 0 });
+  // Background scan status
+  const [backgroundStatus, setBackgroundStatus] = useState<BackgroundScanStatus | null>(null);
+  const [refreshingBackground, setRefreshingBackground] = useState(false);
+
   const runningRef = useRef(false);
   const aiIntentRef = useRef(aiIntent);
   aiIntentRef.current = aiIntent;
@@ -142,6 +157,42 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
     if (touched.current) return;
     filtersRef.current = f;
     setFiltersState(f);
+  }, []);
+
+  // Load cached results on mount
+  const loadCachedResults = useCallback(async () => {
+    try {
+      const r = await fetch("/api/explore");
+      if (r.ok) {
+        const data = await r.json();
+        if (data.cached && data.offers) {
+          setOffers(data.offers);
+          setMatchCount(data.count);
+          setCompaniesScanned(data.summary?.companiesScanned || 0);
+          setCompaniesAvailable(data.summary?.companiesAvailable || 0);
+          setCapHit(data.summary?.capHit || false);
+          setDroppedNoDate(0); // not in cache summary
+          setPartial(false);
+          setStatus(`${data.offers.length} cached role${data.offers.length === 1 ? "" : "s"} — last updated ${new Date(data.generatedAt).toLocaleString()}`);
+          setPhase(data.offers.length > 0 ? "results" : (isBroadSearch(filtersRef.current) ? "empty-current" : "empty-loose"));
+        }
+      }
+    } catch {
+      // Ignore, will fall through to empty state
+    }
+  }, []);
+
+  // Load background status on mount
+  const loadBackgroundStatus = useCallback(async () => {
+    try {
+      const r = await fetch("/api/background-status");
+      if (r.ok) {
+        const data = await r.json();
+        setBackgroundStatus(data?.scan || null);
+      }
+    } catch {
+      // Ignore
+    }
   }, []);
 
   const discover = useCallback(async () => {
@@ -168,10 +219,10 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
 
     const acc: DiscoveredOffer[] = [];
     let sawError = "";
-    let companiesScannedAcc = 0; // 0 at the end = the directories never downloaded → degraded, not empty
-    let capHitAcc = false; // scan was capped (only a slice of the universe searched)
-    let datasetIssueAcc = false; // some ATS dataset was stale/empty/unreachable
-    let droppedNoDateAcc = 0; // postings dropped for lacking a publish date
+    let companiesScannedAcc = 0;
+    let capHitAcc = false;
+    let datasetIssueAcc = false;
+    let droppedNoDateAcc = 0;
     try {
       const r = await fetch("/api/explore", {
         method: "POST",
@@ -209,8 +260,6 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
                 setSources((s) => ({ ...s, [ev.ats]: { ...s[ev.ats as AtsSource], state: "active", companies: ev.companies } }));
                 break;
               case "progress":
-                // `matches` is the GLOBAL running total (the engine batches the
-                // offer list to the very end), so it drives the live hero counter.
                 setMatchCount((m) => Math.max(m, ev.matches));
                 setSources((s) => ({ ...s, [ev.ats]: { ...s[ev.ats as AtsSource], state: "active", done: ev.scanned, total: ev.total } }));
                 break;
@@ -268,15 +317,46 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
       setError(sawError);
       setPhase("failed");
     } else if (capHitAcc || datasetIssueAcc || droppedNoDateAcc > 0 || companiesScannedAcc === 0) {
-      // Maintainer's RULE (#1199): it is NOT "all caught up" if the scan was capped,
-      // a dataset was stale/unreachable, postings were dropped for missing a date, OR
-      // nothing was searched at all (legacy 0-companies fallback when --json is absent).
-      // Truly-empty is only when live datasets were fully searched and found nothing.
       setPhase("degraded");
     } else {
       setPhase(isBroadSearch(f) ? "empty-current" : "empty-loose");
     }
   }, []);
+
+  const refreshBackgroundScan = useCallback(async () => {
+    if (refreshingBackground) return;
+    setRefreshingBackground(true);
+    try {
+      const f = filtersRef.current;
+      const r = await fetch("/api/explore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(f),
+      });
+      if (r.ok) {
+        // Poll background status until done
+        const poll = async () => {
+          for (let i = 0; i < 60; i++) { // max 5 minutes
+            await new Promise(r => setTimeout(r, 5000));
+            try {
+              const s = await fetch("/api/background-status").then(r => r.json());
+              setBackgroundStatus(s?.scan || null);
+              if (s?.scan?.lastRunStatus === "success" || s?.scan?.lastRunStatus === "error") {
+                // Reload cached results
+                await loadCachedResults();
+                break;
+              }
+            } catch {}
+          }
+        };
+        await poll();
+      }
+    } catch (e) {
+      console.error("Background refresh failed:", e);
+    } finally {
+      setRefreshingBackground(false);
+    }
+  }, [refreshingBackground, loadCachedResults]);
 
   const addToPipeline = useCallback(async (list: DiscoveredOffer[]) => {
     const fresh = list.filter((o) => !added.has(o.url));
@@ -291,10 +371,6 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
       const d = (await r.json()) as { added?: number };
       if (d.added && d.added > 0) {
         setAdded((s) => new Set([...s, ...fresh.map((o) => o.url)]));
-        // The new inbox rows were written server-side. Invalidate the Next router
-        // cache so the (server-rendered) Pipeline view shows them instead of a stale
-        // snapshot, and ping live listeners (today's dashboard, pipeline provider) —
-        // otherwise the user adds a job, opens Pipeline, and sees it empty (disc#5).
         router.refresh();
         if (typeof window !== "undefined") {
           window.dispatchEvent(new CustomEvent("co-job-done", { detail: { kind: "explore-add" } }));
@@ -478,6 +554,12 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
     setPhase(RUNNING.has(snap.phase) ? (snap.offers.length ? "results" : "idle") : snap.phase);
   }, []);
 
+  // Load cached results and background status on mount
+  useEffect(() => {
+    loadCachedResults();
+    loadBackgroundStatus();
+  }, [loadCachedResults, loadBackgroundStatus]);
+
   // Persist only SETTLED states (never mid-stream) so a reload restores a complete set.
   useEffect(() => {
     const SETTLED = new Set<Phase>(["results", "empty-current", "empty-loose", "failed", "degraded", "blocked"]);
@@ -500,8 +582,11 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
       offers, sources, matchCount, companiesScanned, companiesAvailable, capHit, droppedNoDate, status, partial, error, added, adding,
       discover, addToPipeline, applyPatch, reset,
       mode, setMode, aiIntent, setAiIntent, discoverAI, aiTrace, aiCost,
+      backgroundStatus,
+      refreshingBackground,
+      refreshBackgroundScan,
     }),
-    [filters, setFilters, initFilters, phase, offers, sources, matchCount, companiesScanned, companiesAvailable, capHit, droppedNoDate, status, partial, error, added, adding, discover, addToPipeline, applyPatch, reset, mode, setMode, aiIntent, discoverAI, aiTrace, aiCost],
+    [filters, setFilters, initFilters, phase, offers, sources, matchCount, companiesScanned, companiesAvailable, capHit, droppedNoDate, status, partial, error, added, adding, discover, addToPipeline, applyPatch, reset, mode, setMode, aiIntent, discoverAI, aiTrace, aiCost, backgroundStatus, refreshingBackground, refreshBackgroundScan]
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
