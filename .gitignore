@@ -399,3 +399,6 @@ data/interview-prep/
 .next/
 web/.next/
 web/out/
+
+# Local repair snapshots (contain tracker/pipeline data)
+backups/repair-*/
