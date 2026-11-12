@@ -2,7 +2,7 @@ import yaml
 import sys
 from pathlib import Path
 
-wiki_root = Path('/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki')
+wiki_root = Path('~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki').expanduser()
 entities_dir = wiki_root / 'entities'
 concepts_dir = wiki_root / 'concepts'
 

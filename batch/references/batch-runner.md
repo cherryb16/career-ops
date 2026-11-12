@@ -35,12 +35,12 @@ ls batch/logs/ | tail -10
 ## Scratch Directory Output
 
 AGY batch runs write output to the scratch directory:
-- **Reports:** `/Users/mac_studio/.gemini/antigravity-cli/scratch/reports/`
-- **Tracker additions:** `/Users/mac_studio/.gemini/antigravity-cli/scratch/batch/tracker-additions/`
+- **Reports:** `~/.gemini/antigravity-cli/scratch/reports/`
+- **Tracker additions:** `~/.gemini/antigravity-cli/scratch/batch/tracker-additions/`
 
 **Pitfall:** The scratch directory is ephemeral. Reports created by AGI batch runs must be manually copied to `reports/`:
 ```bash
-cp /Users/mac_studio/.gemini/antigravity-cli/scratch/reports/*.md reports/
+cp ~/.gemini/antigravity-cli/scratch/reports/*.md reports/
 ```
 
 ## Git Merge Conflicts

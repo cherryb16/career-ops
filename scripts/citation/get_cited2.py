@@ -1,6 +1,6 @@
 import yaml, re, sys, os
 
-wiki_path = "/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki"
+wiki_path = os.path.expanduser("~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki")
 os.chdir(wiki_path)
 
 sources = set()

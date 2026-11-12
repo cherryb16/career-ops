@@ -143,12 +143,12 @@ The worker produces:
 ### AGY Output Location
 
 AGI batch runs write output to an ephemeral scratch directory:
-- **Reports:** `/Users/mac_studio/.gemini/antigravity-cli/scratch/reports/`
-- **Tracker additions:** `/Users/mac_studio/.gemini/antigravity-cli/scratch/batch/tracker-additions/`
+- **Reports:** `~/.gemini/antigravity-cli/scratch/reports/`
+- **Tracker additions:** `~/.gemini/antigravity-cli/scratch/batch/tracker-additions/`
 
 **Pitfall:** The scratch directory is ephemeral. After a batch run completes, copy report files to the project `reports/` directory:
 ```bash
-cp /Users/mac_studio/.gemini/antigravity-cli/scratch/reports/*.md reports/
+cp ~/.gemini/antigravity-cli/scratch/reports/*.md reports/
 ```
 
 ### State File "failed" Status

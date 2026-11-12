@@ -8,7 +8,8 @@
 #   scripts/backup-agents-md.sh --force    # always overwrite the snapshot
 set -euo pipefail
 
-REPO="/Users/mac_studio/Documents/Githubv2/career-ops"
+# Resolve the checkout from this script's location so it works on any Mac.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$REPO/AGENTS.md"
 DEST_DIR="$HOME/Documents/career-ops-backups"
 DEST="$DEST_DIR/AGENTS.md.bak"

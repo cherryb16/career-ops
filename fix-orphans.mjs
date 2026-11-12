@@ -1,6 +1,10 @@
 import { readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const APPS_FILE = '/Users/mac_studio/Documents/Githubv2/career-ops/data/applications.md';
+// Resolve from this script's location so it works from any checkout path
+// (e.g. the iCloud-synced copy on either Mac).
+const APPS_FILE = join(dirname(fileURLToPath(import.meta.url)), 'data', 'applications.md');
 const content = readFileSync(APPS_FILE, 'utf-8');
 const lines = content.split('\n');
 

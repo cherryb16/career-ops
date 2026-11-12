@@ -2,7 +2,7 @@ import os
 import yaml
 from pathlib import Path
 
-wiki_root = Path("/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki")
+wiki_root = Path("~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki").expanduser()
 
 # Get all raw files
 raw_root = wiki_root / "raw" / "notes"

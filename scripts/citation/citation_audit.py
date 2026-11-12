@@ -3,11 +3,11 @@ import re
 
 # Find all .md files under raw/notes
 raw_files = set()
-for root, dirs, files in os.walk("/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki/raw/notes"):
+for root, dirs, files in os.walk(os.path.expanduser("~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki/raw/notes")):
     for f in files:
         if f.endswith('.md'):
             full_path = os.path.join(root, f)
-            rel_path = os.path.relpath(full_path, "/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki")
+            rel_path = os.path.relpath(full_path, os.path.expanduser("~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki"))
             raw_files.add(rel_path)
 
 print(f"Total raw .md files: {len(raw_files)}")
@@ -15,7 +15,7 @@ print(f"Total raw .md files: {len(raw_files)}")
 # Read all entity and concept pages to extract sources
 cited_sources = set()
 
-for base in ["/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki/entities", "/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki/concepts"]:
+for base in [os.path.expanduser("~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki/entities"), os.path.expanduser("~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki/concepts")]:
     for root, dirs, files in os.walk(base):
         for f in files:
             if f.endswith('.md'):
@@ -47,7 +47,7 @@ for base in ["/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Docu
 print(f"Total unique cited sources: {len(cited_sources)}")
 
 # Also check index.md for wikilinks
-index_path = "/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki/index.md"
+index_path = os.path.expanduser("~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki/index.md")
 try:
     with open(index_path, 'r') as fp:
         content = fp.read()
@@ -57,7 +57,7 @@ except Exception as e:
     print(f"Error reading index.md: {e}")
 
 # Check log.md for processed sources
-log_path = "/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki/log.md"
+log_path = os.path.expanduser("~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki/log.md")
 try:
     with open(log_path, 'r') as fp:
         content = fp.read()
@@ -74,7 +74,7 @@ print(f"\nUncited raw files: {len(uncited)}")
 # Filter out artifacts (empty files, templates, etc.)
 substantive_uncited = []
 for f in sorted(uncited):
-    full = os.path.join("/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki", f)
+    full = os.path.join(os.path.expanduser("~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki"), f)
     try:
         size = os.path.getsize(full)
         if size > 100:  # Only consider files > 100 bytes

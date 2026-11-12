@@ -23,9 +23,10 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const HERMES_BIN = resolve(process.env.HERMES_BIN || join(process.env.HOME || '/Users/mac_studio', '.hermes', 'hermes-agent', 'venv', 'bin', 'hermes'));
+const HERMES_BIN = resolve(process.env.HERMES_BIN || join(process.env.HOME || homedir(), '.hermes', 'hermes-agent', 'venv', 'bin', 'hermes'));
 
 const COMPANY_TIMEOUT = 300000; // 5 minutes per attempt
 const MAX_RETRIES = 2; // Max retries per company

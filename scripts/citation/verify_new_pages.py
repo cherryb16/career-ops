@@ -1,7 +1,7 @@
 import yaml
 from pathlib import Path
 
-wiki_root = Path('/Users/mac_studio/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki')
+wiki_root = Path('~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes/Wiki').expanduser()
 
 # Check the new pages have valid frontmatter and sources
 new_pages = [
