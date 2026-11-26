@@ -1180,7 +1180,7 @@ process_offer() {
   # Build the prompt with placeholders replaced
   local prompt
   if [[ "$SKIP_PDF" == "true" ]]; then
-    prompt="Process this job offer. Run the pipeline: A-G evaluation + report .md + tracker line. Do not generate PDF; write ❌ in the tracker PDF column and set \"pdf\": null in the final JSON."
+    prompt="Process this job offer. Run the pipeline: A-G evaluation + report .md + tracker line. PDF generation is disabled for this run: skip Step 4 entirely regardless of the score or auto_pdf_score_threshold, do not run generate-pdf.mjs, write ❌ in the tracker PDF column and set \"pdf\": null in the final JSON."
     echo "    ⏭️  --skip-pdf set — skipping PDF generation for #$id ($url)"
   else
     prompt="Process this job offer. Run the full pipeline: A-G evaluation + report .md + optional PDF + tracker line."

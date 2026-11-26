@@ -483,11 +483,15 @@ function cronWorkflow() {
       workflowLog,
       `Batch input rebuilt: ${rebuilt.pending} pending · ${rebuilt.fresh} new (IDs from ${rebuilt.firstId}) · ${rebuilt.alreadyStated} already in state\n`,
     );
-    const batchResult = execFileSync('./batch/batch-runner.sh', ['--cli', 'agy', '--parallel', '2', '--limit', '30'], {
+    // Multi-model fanout: every free route in config/batch-routes.json plus AGY,
+    // each running batch-runner.sh on small chunks from a shared queue. No cap;
+    // the fanout stops dispatching at its own deadline so merge/verify still run.
+    const batchResult = execFileSync('node', ['scripts/batch-fanout.mjs'], {
       cwd: ROOT,
       env: process.env,
       encoding: 'utf8',
-      timeout: 3600_000,
+      timeout: 10 * 3600_000,
+      maxBuffer: 64 * 1024 * 1024,
     });
     appendAtomic(workflowLog, batchResult);
   } catch (err) {
