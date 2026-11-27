@@ -379,6 +379,18 @@ function cronWorkflow() {
     appendAtomic(workflowLog, `websearch error: ${output}\n`);
   }
 
+  // 2b. Ingest web-search results into the pipeline. web-search.mjs only saves
+  // them to data/websearch-results/; without this step none of them were ever
+  // queued. Same title/location filters and dedup as the portal scan.
+  appendAtomic(workflowLog, '=== WEBSEARCH INGEST ===\n');
+  try {
+    appendAtomic(workflowLog, execFileSync('node', ['scripts/ingest-websearch.mjs'], {
+      cwd: ROOT, env: process.env, encoding: 'utf8', timeout: 300_000,
+    }));
+  } catch (err) {
+    appendAtomic(workflowLog, `websearch ingest error: ${err.stdout || err.message}\n`);
+  }
+
   // 3. Explore cache refresh (feeds the read-only web dashboard)
   appendAtomic(workflowLog, '=== EXPLORE CACHE REFRESH ===\n');
   try {
@@ -408,6 +420,17 @@ function cronWorkflow() {
   }
 
   // 4. Liveness sweep on pending pipeline entries
+  // Move triage/seniority skips out of Pending first (reconcile-pipeline only
+  // moves skips that have a report or a dealbreaker), so the liveness sweep
+  // checks postings that are actually waiting, not ~1,000 already-screened ones.
+  try {
+    appendAtomic(workflowLog, execFileSync('node', ['scripts/reconcile-skips.mjs'], {
+      cwd: ROOT, env: process.env, encoding: 'utf8', timeout: 300_000,
+    }));
+  } catch (err) {
+    appendAtomic(workflowLog, `reconcile-skips error: ${err.stdout || err.message}\n`);
+  }
+
   appendAtomic(workflowLog, '=== LIVENESS SWEEP ===\n');
   try {
     const pipeline = readFileSync(PIPELINE_FILE, 'utf8');
@@ -419,7 +442,7 @@ function cronWorkflow() {
         cwd: ROOT,
         env: process.env,
         encoding: 'utf8',
-        timeout: 3600000, // 60 min — the throttled sweep needs far longer than 300s for 400+ URLs
+        timeout: 6_000_000, // 100 min: ~55 min per 400 throttled URLs; a timeout discards every result, so leave headroom
       });
       appendAtomic(workflowLog, livenessResult);
       for (const line of livenessResult.split('\n')) {

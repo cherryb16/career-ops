@@ -2,12 +2,38 @@
   "_comment": "Batch evaluation workers for scripts/batch-fanout.mjs. Every worker runs batch/batch-runner.sh; free routes first. Edit, reorder or disable routes here.",
   "chunk_size": 6,
   "skip_pdf": true,
-  "deadline_minutes": 540,
+  "deadline_minutes": 480,
   "retire_after_dead_chunks": 2,
   "routes": [
-    { "name": "or-free",  "cli": "hermes", "provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free", "parallel": 2, "enabled": true },
-    { "name": "free",     "cli": "hermes", "provider": "nous",       "model": "upstage/solar-mini4:free",            "parallel": 1, "enabled": true },
-    { "name": "nim-free", "cli": "hermes", "provider": "nvidia",     "model": "nvidia/nemotron-3.5-super-vl-120b-a12b", "parallel": 1, "enabled": true },
-    { "name": "agy",      "cli": "agy",                                                                              "parallel": 2, "enabled": true }
+    {
+      "name": "or-free",
+      "cli": "hermes",
+      "provider": "openrouter",
+      "model": "nvidia/nemotron-3.5-lightning:free",
+      "parallel": 2,
+      "enabled": true
+    },
+    {
+      "name": "free",
+      "cli": "hermes",
+      "provider": "nous",
+      "model": "upstage/solar-mini4:free",
+      "parallel": 1,
+      "enabled": true
+    },
+    {
+      "name": "nim-free",
+      "cli": "hermes",
+      "provider": "nvidia",
+      "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "parallel": 1,
+      "enabled": true
+    },
+    {
+      "name": "agy",
+      "cli": "agy",
+      "parallel": 2,
+      "enabled": true
+    }
   ]
 }

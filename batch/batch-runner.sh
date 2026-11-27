@@ -1869,7 +1869,13 @@ main() {
   fi
 
   # Merge tracker additions
-  merge_tracker
+  # A caller that gates reports before they reach the tracker (scripts/batch-fanout.mjs)
+  # sets BATCH_DEFER_CLOSEOUT=1 and runs merge/reconcile/verify itself afterwards.
+  if [[ "${BATCH_DEFER_CLOSEOUT:-}" == "1" ]]; then
+    echo "=== Closeout deferred to caller (BATCH_DEFER_CLOSEOUT=1) ==="
+  else
+    merge_tracker
+  fi
 
   # Print summary
   print_summary
